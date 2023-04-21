@@ -92,8 +92,7 @@ def humanml3d(
         ds = ds.map(
             functools.partial(normalize, mean=mean, std=std),
             num_parallel_calls=AUTOTUNE,
-        )
-        ds = ds.map(
+        ).map(
             lambda x: {"motion": x["motion"]},
             num_parallel_calls=AUTOTUNE,
         )
@@ -106,16 +105,17 @@ def humanml3d(
         if loop_config.total_steps % num_samples > 0:
             count += 1
 
-        ds = ds.shuffle(num_samples, reshuffle_each_iteration=True)
-
-        ds = ds.repeat(count * loop_config.batch_size)
-
-        ds = ds.padded_batch(
-            loop_config.batch_size,
-            padded_shapes={
-                "motion": (config.max_length, None),
-            },
-        ).prefetch(AUTOTUNE)
+        ds = (
+            ds.shuffle(num_samples, reshuffle_each_iteration=True)
+            .repeat(count * loop_config.batch_size)
+            .padded_batch(
+                loop_config.batch_size,
+                padded_shapes={
+                    "motion": (config.max_length, None),
+                },
+            )
+            .prefetch(AUTOTUNE)
+        )
         return ds
 
     train_ds = norm_and_batch(train_ds)
