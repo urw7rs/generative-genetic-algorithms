@@ -290,10 +290,11 @@ def train_loop(
         logs.updates = jax.tree_map(lambda x: x[0], new_logs)
 
         if call_writer(elapsed):
+            # state is replicated for each device
+            step = int(state.step[0])
             for key, value in logs["metrics"].items():
-                # state is replicated for each device
-                step = int(state.step[0])
-                writer.add_scalar(key, onp.asarray(value), step)
+                if "val" not in key:
+                    writer.add_scalar(key, onp.asarray(value), step)
 
         if call_eval(elapsed):
             eval_history = ciclo.history()
