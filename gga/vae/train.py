@@ -4,6 +4,8 @@ from pathlib import Path
 
 import dataclasses
 
+import numpy as onp
+
 import tensorflow as tf
 
 import ciclo
@@ -17,6 +19,8 @@ from flax import jax_utils
 from flax.training import common_utils
 from flax.training import train_state
 from flax.training import dynamic_scale as dynamic_scale_lib
+
+from torch.utils.tensorboard import SummaryWriter
 
 from . import models
 
@@ -58,10 +62,6 @@ def create_learning_rate_schedule(learning_rate: float, warmup_steps: int):
         ],
         boundaries=[warmup_steps],
     )
-
-
-# Primary training / eval / decode step functions.
-# -----------------------------------------------------------------------------
 
 
 def mse_loss(preds, target):
@@ -120,7 +120,7 @@ def train_step(state, batch, config, dropout_rng=None):
         )
 
     logs = ciclo.logs()
-    logs.add_metric("recons_loss", loss)
+    logs.add_metric("train/recons_loss", loss)
     return logs, new_state
 
 
@@ -264,39 +264,72 @@ def train_loop(
     )
 
     call_checkpoint = ciclo.every(steps=1000)
-    checkpoint = ciclo.checkpoint(
-        f"logdir/{Path(__file__).stem}/{int(time())}",
-        monitor="recons_loss",
+    checkpoint = ciclo.checkpoint(f"logdir/{Path(__file__).stem}/{int(time())}")
+    checkpoint_best = ciclo.checkpoint(
+        f"logdir/{Path(__file__).stem}/{int(time())}/best",
+        monitor="val/recons_loss",
         mode="min",
+        keep=3,
     )
 
     call_eval = ciclo.every(10_000)
+    call_writer = ciclo.every(50)
 
-    keras_bar = ciclo.keras_bar(total=loop_config.total_steps)
+    # keras averages metrics by default set always_stateful to True to disable this behavior
+    keras_bar = ciclo.keras_bar(total=loop_config.total_steps, always_stateful=True)
     history = ciclo.history()
 
+    writer = SummaryWriter()
+
+    logs = ciclo.logs()
     for elapsed, batch in ciclo.elapse(
         train_ds.as_numpy_iterator(), stop=loop_config.total_steps
     ):
-        logs = ciclo.logs()
         batch = common_utils.shard(batch)
-        logs.updates, state = p_train_step(state, batch, dropout_rng=dropout_rngs)
-        logs = jax.tree_util.tree_map(lambda x: x[0], logs)
+        new_logs, state = p_train_step(state, batch, dropout_rng=dropout_rngs)
+        logs.updates = jax.tree_map(lambda x: x[0], new_logs)
+
+        if call_writer(elapsed):
+            for key, value in logs["metrics"].items():
+                # state is replicated for each device
+                step = int(state.step[0])
+                writer.add_scalar(key, onp.asarray(value), step)
+
+        if call_eval(elapsed):
+            eval_history = ciclo.history()
+
+            for eval_elapsed, batch in ciclo.elapse(
+                eval_ds.as_numpy_iterator(), stop=loop_config.eval_steps
+            ):
+                eval_logs = ciclo.logs()
+
+                batch = common_utils.shard(batch)
+                eval_logs.updates, state = p_eval_step(
+                    state, batch, dropout_rng=dropout_rngs
+                )
+                eval_history.commit(eval_elapsed, eval_logs)
+
+            key = "recons_loss"
+            recon_loss = onp.stack(eval_history.collect(key)).mean(axis=0)
+            metrics = {key: recon_loss}
+
+            metrics = jax.tree_map(lambda x: x[0], metrics)
+
+            logs.add_metric("val/recons_loss", metrics[key])
+
+            step = int(state.step[0])
+            writer.add_scalar(f"val/{key}", onp.asarray(metrics[key]), step)
+
+            single_state = jax.tree_util.tree_map(lambda x: x[0], state)
+            checkpoint_best(elapsed, single_state, logs)
 
         if call_checkpoint(elapsed):
             single_state = jax.tree_util.tree_map(lambda x: x[0], state)
             checkpoint(elapsed, single_state, logs)
 
-        if call_eval(elapsed):
-            for elapsed, batch in ciclo.elapse(
-                eval_ds.as_numpy_iterator(), stop=loop_config.eval_steps
-            ):
-                batch = common_utils.shard(batch)
-                logs.updates, state = p_eval_step(
-                    state, batch, dropout_rng=dropout_rngs
-                )
-
         keras_bar(elapsed, logs)
         history.commit(elapsed, logs)
+
+    writer.close()
 
     return state, history

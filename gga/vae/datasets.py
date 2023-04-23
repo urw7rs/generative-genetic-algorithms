@@ -115,6 +115,7 @@ def humanml3d(
                 padded_shapes={
                     "motion": (config.max_length, None),
                 },
+                drop_remainder=True,
             )
             .prefetch(AUTOTUNE)
         )
