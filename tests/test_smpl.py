@@ -1,5 +1,4 @@
 import jax
-import jax.numpy as jnp
 
 from gga import smpl
 
@@ -10,4 +9,4 @@ def test_recover_from_ric():
 
     data = smpl.recover_from_ric(data, 22)
 
-    breakpoint()
+    assert data.shape[-1] == 3
