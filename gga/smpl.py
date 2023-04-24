@@ -382,12 +382,12 @@ def recover_root_rot_pos(data: jax.Array):
     rot_vel = data[..., 0]
     r_rot_ang = jnp.zeros_like(rot_vel)
     # Get Y-axis rotation from rotation velocity
-    r_rot_ang.at[..., 1:].set(rot_vel[..., :-1])
+    r_rot_ang = r_rot_ang.at[..., 1:].set(rot_vel[..., :-1])
     r_rot_ang = jnp.cumsum(r_rot_ang, axis=-1)
 
     r_rot_quat = jnp.zeros(data.shape[:-1] + (4,), dtype=data.dtype)
-    r_rot_quat.at[..., 0].set(jnp.cos(r_rot_ang))
-    r_rot_quat.at[..., 2].set(jnp.sin(r_rot_ang))
+    r_rot_quat = r_rot_quat.at[..., 0].set(jnp.cos(r_rot_ang))
+    r_rot_quat = r_rot_quat.at[..., 2].set(jnp.sin(r_rot_ang))
 
     r_pos = jnp.zeros(data.shape[:-1] + (3,), dtype=data.dtype)
     r_pos = r_pos.at[..., 1:, [0, 2]].set(data[..., :-1, 1:3])
@@ -396,7 +396,7 @@ def recover_root_rot_pos(data: jax.Array):
 
     r_pos = jnp.cumsum(r_pos, axis=-2)
 
-    r_pos.at[..., 1].set(data[..., 3])
+    r_pos = r_pos.at[..., 1].set(data[..., 3])
     return r_rot_quat, r_pos
 
 
@@ -441,8 +441,8 @@ def recover_from_ric(data: jax.Array, num_joints: int = 22):
     positions = qrot(jnp.expand_dims(qinv(r_rot_quat), axis=-2), positions)
 
     # Add root XZ to joints
-    positions.at[..., 0].set(positions[..., 0] + r_pos[..., 0:1])
-    positions.at[..., 2].set(positions[..., 0] + r_pos[..., 2:3])
+    positions = positions.at[..., 0].set(positions[..., 0] + r_pos[..., 0:1])
+    positions = positions.at[..., 2].set(positions[..., 2] + r_pos[..., 2:3])
 
     # Concate root and joints
     positions = jnp.concatenate([jnp.expand_dims(r_pos, axis=-2), positions], axis=-2)

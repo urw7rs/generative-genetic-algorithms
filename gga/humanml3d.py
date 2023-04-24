@@ -127,6 +127,8 @@ def load_motion(
     ds = {
         "train": train_ds,
         "val": eval_ds,
+        "mean": mean,
+        "std": std,
     }
 
     return ds
@@ -199,6 +201,8 @@ def load_motion_text(
     ds = {
         "train": train_ds,
         "val": eval_ds,
+        "mean": mean,
+        "std": std,
     }
 
     return ds

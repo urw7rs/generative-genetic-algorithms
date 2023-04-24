@@ -6,9 +6,6 @@ import textwrap
 
 import matplotlib
 import matplotlib.pyplot as plt
-import mpl_toolkits.mplot3d.axes3d as p3
-
-
 from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -36,7 +33,13 @@ def list_cut_average(ll, intervals):
 
 
 def plot_skeleton(
-    save_path, joints, title, figsize=(3, 3), fps=120, radius=3, kinematic_tree=skeleton
+    save_path,
+    joints,
+    title,
+    figsize=(5, 5),
+    fps=20,
+    radius=3,
+    kinematic_tree=skeleton,
 ):
     matplotlib.use("Agg")
 
@@ -46,9 +49,7 @@ def plot_skeleton(
         ax.set_xlim3d([-radius / 2, radius / 2])
         ax.set_ylim3d([0, radius])
         ax.set_zlim3d([-radius / 3.0, radius * 2 / 3.0])
-        # print(title)
         fig.suptitle(title, fontsize=10)
-        ax.grid(b=False)
 
     def plot_xzPlane(minx, maxx, miny, minz, maxz):
         # Plot a plane XZ
@@ -65,13 +66,11 @@ def plot_skeleton(
     #         return ax
 
     # (seq_len, joints_num, 3)
-    data = joints.copy().reshape(len(joints), -1, 3)
     fig = plt.figure(figsize=figsize)
     plt.tight_layout()
-    ax = p3.Axes3D(fig)
-    init()
-    MINS = data.min(axis=0).min(axis=0)
-    MAXS = data.max(axis=0).max(axis=0)
+    ax = plt.axes(projection="3d")
+    MINS = joints.min(axis=0).min(axis=0)
+    MAXS = joints.max(axis=0).max(axis=0)
     # colors = ['red', 'blue', 'black', 'red', 'blue',
     #           'darkblue', 'darkblue', 'darkblue', 'darkblue', 'darkblue',
     #           'darkred', 'darkred', 'darkred', 'darkred', 'darkred']
@@ -93,25 +92,27 @@ def plot_skeleton(
         "#DDB50E",
     ]
 
-    frame_number = data.shape[0]
-    #     print(dataset.shape)
+    frame_number = joints.shape[0]
+    #     print(jointsset.shape)
 
     height_offset = MINS[1]
-    data[:, :, 1] -= height_offset
-    trajec = data[:, 0, [0, 2]]
+    joints[:, :, 1] -= height_offset
+    joints[..., 0] -= joints[:, 0:1, 0]
+    joints[..., 2] -= joints[:, 0:1, 2]
 
-    data[..., 0] -= data[:, 0:1, 0]
-    data[..., 2] -= data[:, 0:1, 2]
+    trajec = joints[:, 0, [0, 2]]
 
     #     print(trajec.shape)
 
     def update(index):
-        #         print(index)
-        # ax.lines = []
-        # ax.collections = []
         ax.view_init(elev=120, azim=-90)
         ax.dist = 7.5
-        #         ax =
+
+        ax.clear()
+
+        init()
+
+        """
         plot_xzPlane(
             MINS[0] - trajec[index, 0],
             MAXS[0] - trajec[index, 0],
@@ -119,13 +120,7 @@ def plot_skeleton(
             MINS[2] - trajec[index, 1],
             MAXS[2] - trajec[index, 1],
         )
-        #         ax.scatter(dataset[index, :22, 0], dataset[index, :22, 1], dataset[index, :22, 2], color='black', s=3)
-
-        # if index > 1:
-        #     ax.plot3D(trajec[:index, 0] - trajec[index, 0], np.zeros_like(trajec[:index, 0]),
-        #               trajec[:index, 1] - trajec[index, 1], linewidth=1.0,
-        #               color='blue')
-        # #             ax = plot_xzPlane(ax, MINS[0], MAXS[0], 0, MINS[2], MAXS[2])
+        """
 
         for i, (chain, color) in enumerate(zip(kinematic_tree, colors)):
             #             print(color)
@@ -133,14 +128,14 @@ def plot_skeleton(
                 linewidth = 4.0
             else:
                 linewidth = 2.0
+
             ax.plot3D(
-                data[index, chain, 0],
-                data[index, chain, 1],
-                data[index, chain, 2],
+                joints[index, chain, 0],
+                joints[index, chain, 1],
+                joints[index, chain, 2],
                 linewidth=linewidth,
                 color=color,
             )
-        #         print(trajec[:index, 0].shape)
 
         plt.axis("off")
         ax.set_xticklabels([])
@@ -151,9 +146,6 @@ def plot_skeleton(
         fig, update, frames=frame_number, interval=1000 / fps, repeat=False
     )
 
-    # writer = FFMpegFileWriter(fps=fps)
-    ani.save(save_path, fps=fps)
-    # ani = FuncAnimation(fig, update, frames=frame_number, interval=1000 / fps, repeat=False, init_func=init)
-    # ani.save(save_path, writer='pillow', fps=1000 / fps)
+    ani.save(save_path, fps=fps, dpi=100)
 
     plt.close()
