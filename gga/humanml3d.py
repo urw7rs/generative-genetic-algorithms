@@ -65,6 +65,18 @@ class HumanML3DConfig:
     max_length: int = 196
 
 
+def length_mask(length, max_length):
+    idx = tf.range(max_length, dtype=length.dtype)
+
+    mask = tf.where(
+        idx < length,
+        tf.ones_like(idx),
+        tf.zeros_like(idx),
+    )
+
+    return mask
+
+
 def load_motion(
     loop_config: vae.train.LoopConfig, config: HumanML3DConfig
 ) -> tf.data.Dataset:
@@ -93,7 +105,10 @@ def load_motion(
             functools.partial(normalize, mean=mean, std=std),
             num_parallel_calls=AUTOTUNE,
         ).map(
-            lambda x: {"motion": x["motion"]},
+            lambda x: {
+                "motion": x["motion"],
+                "mask": length_mask(x["length"], max_length=config.max_length),
+            },
             num_parallel_calls=AUTOTUNE,
         )
 
@@ -114,6 +129,7 @@ def load_motion(
                 loop_config.batch_size,
                 padded_shapes={
                     "motion": (config.max_length, None),
+                    "mask": (config.max_length,),
                 },
                 drop_remainder=True,
             )
@@ -166,6 +182,7 @@ def load_motion_text(
             lambda x: {
                 "motion": x["motion"],
                 "text": tf.expand_dims(x["caption"], axis=0),
+                "mask": length_mask(x["length"], max_length=config.max_length),
             },
             num_parallel_calls=AUTOTUNE,
         )
@@ -188,6 +205,7 @@ def load_motion_text(
                 padded_shapes={
                     "motion": (config.max_length, None),
                     "text": (1,),
+                    "mask": (config.max_length,),
                 },
                 drop_remainder=True,
             )

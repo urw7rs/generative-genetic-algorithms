@@ -75,9 +75,8 @@ def train_step(state, batch, config, dropout_rng=None, noise_rng=None):
     # metadata.
     # if such features are not present they are ignored and the example is treated
     # like a normal, unpacked sequence example.
-    train_keys = ["motion"]
-    (inputs,) = (batch.get(k, None) for k in train_keys)
-    targets = inputs
+    train_keys = ["motion", "mask"]
+    (inputs, input_mask) = (batch.get(k, None) for k in train_keys)
 
     dropout_rng = jax.random.fold_in(dropout_rng, state.step)
     noise_rng = jax.random.fold_in(noise_rng, state.step)
@@ -87,11 +86,11 @@ def train_step(state, batch, config, dropout_rng=None, noise_rng=None):
         recons, mu, logvar, noise = models.Transformer(config).apply(
             {"params": params},
             inputs,
-            targets,
+            input_mask,
             rngs={"dropout": dropout_rng, "noise": noise_rng},
         )
 
-        loss = mse_loss(recons, targets)
+        loss = mse_loss(recons, inputs)
         return loss, recons
 
     if state.dynamic_scale:
@@ -127,9 +126,8 @@ def train_step(state, batch, config, dropout_rng=None, noise_rng=None):
 
 def eval_step(state, batch, config, dropout_rng=None, noise_rng=None):
     """Calculate evaluation metrics on a batch."""
-    eval_keys = ["motion"]
-    (inputs,) = (batch.get(k, None) for k in eval_keys)
-    targets = inputs
+    eval_keys = ["motion", "mask"]
+    (inputs, input_mask) = (batch.get(k, None) for k in eval_keys)
 
     dropout_rng = jax.random.fold_in(dropout_rng, state.step)
     noise_rng = jax.random.fold_in(noise_rng, state.step)
@@ -139,15 +137,27 @@ def eval_step(state, batch, config, dropout_rng=None, noise_rng=None):
         recons, mu, logvar, noise = models.Transformer(config).apply(
             {"params": params},
             inputs,
-            targets,
+            input_mask,
             rngs={"dropout": dropout_rng, "noise": noise_rng},
         )
 
-        loss = mse_loss(recons, targets)
+        loss = mse_loss(recons, inputs)
         return loss, recons
+
+    def generate_samples(params):
+        return models.Transformer(config).apply(
+            {"params": params},
+            input_mask,
+            config.dtype,
+            rngs={"dropout": dropout_rng, "noise": noise_rng},
+            method="generate",
+        )
 
     loss, recons = loss_fn(state.params)
     loss = jax.lax.pmean(loss, axis_name="device")
+
+    # TODO: compute metrics using generated samples
+    samples = generate_samples(state.params)
 
     logs = ciclo.logs()
     logs.add_metric("recons_loss", loss)
@@ -202,16 +212,15 @@ def create_state(
         train_config.max_len - train_config.latent_length * 2,
         train_config.input_size,
     )
-    target_shape = (
+    input_mask_shape = (
         per_device_batch_size,
         train_config.max_len - train_config.latent_length * 2,
-        train_config.output_size,
     )
 
     initial_variables = jax.jit(m.init)(
         {"params": init_rng, "noise": noise_rng},
         jnp.ones(input_shape, jnp.float32),
-        jnp.ones(target_shape, jnp.float32),
+        jnp.ones(input_mask_shape, jnp.bool_),
     )
 
     learning_rate_fn = create_learning_rate_schedule(

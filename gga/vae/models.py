@@ -452,7 +452,7 @@ class Transformer(nn.Module):
         self.encoder = Encoder(config=config, shared_embedding=self.shared_embedding)
         self.decoder = Decoder(config=config, shared_embedding=self.shared_embedding)
 
-    def encode(self, inputs):
+    def encode(self, inputs, input_mask):
         """Applies Transformer encoder-branch on the inputs.
 
         Args:
@@ -463,7 +463,6 @@ class Transformer(nn.Module):
         """
         config = self.config
         # Make padding attention mask.
-        input_mask = get_mask(inputs)
         input_mask = jnp.concatenate(
             [
                 jnp.ones((inputs.shape[0], config.latent_length * 2)),
@@ -474,12 +473,12 @@ class Transformer(nn.Module):
         encoder_mask = nn.make_attention_mask(
             input_mask, input_mask, dtype=config.dtype
         )
-        return self.encoder(inputs, encoder_mask=encoder_mask), input_mask
+        return self.encoder(inputs, encoder_mask=encoder_mask)
 
     def decode(
         self,
         encoded,
-        targets,
+        target_mask,
     ):
         """Applies Transformer decoder-branch on encoded-input and target.
 
@@ -501,10 +500,9 @@ class Transformer(nn.Module):
             decoder_mask = None
             encoded_mask = jnp.ones((encoded.shape[0], encoded.shape[1]))
             encoder_decoder_mask = nn.make_attention_mask(
-                get_mask(targets), encoded_mask, dtype=config.dtype
+                target_mask, encoded_mask, dtype=config.dtype
             )
         else:
-            target_mask = get_mask(targets)
             encoded_mask = jnp.ones((encoded.shape[0], encoded.shape[1]))
             decoder_mask = nn.make_attention_mask(
                 target_mask,
@@ -517,16 +515,26 @@ class Transformer(nn.Module):
 
         reconstructed = self.decoder(
             encoded,
-            targets,
+            jnp.zeros(
+                (encoded.shape[0], target_mask.shape[1], encoded.shape[2]),
+                dtype=encoded.dtype,
+            ),
             decoder_mask=decoder_mask,
             encoder_decoder_mask=encoder_decoder_mask,
         )
+
+        reconstructed = jnp.where(
+            jnp.tile(target_mask[:, :, None], [1, 1, reconstructed.shape[2]]),
+            reconstructed,
+            jnp.zeros_like(reconstructed),
+        )
+
         return reconstructed.astype(self.config.dtype)
 
     def __call__(
         self,
         inputs,
-        targets,
+        input_mask,
     ):
         """Applies Transformer model on the inputs.
 
@@ -537,7 +545,7 @@ class Transformer(nn.Module):
         Returns:
           reconstructed array from full transformer.
         """
-        (mu, logvar), input_mask = self.encode(inputs)
+        mu, logvar = self.encode(inputs, input_mask)
 
         std = jnp.exp(0.5 * logvar)
 
@@ -545,6 +553,14 @@ class Transformer(nn.Module):
         noise = jax.random.normal(rng, mu.shape, dtype=mu.dtype)
         sampled_latent = std * noise + mu
 
-        recons = self.decode(sampled_latent, targets)  # only used for masks
-        # recons = recons.at[~input_mask].set(jnp.zeros_like(recons[input_mask]))
+        recons = self.decode(sampled_latent, input_mask)
         return recons, mu, logvar, noise
+
+    def generate(self, target_mask, dtype=jnp.float32):
+        rng = self.make_rng(self.rng_collection)
+        noise = jax.random.normal(
+            rng, (*target_mask.shape, self.config.emb_dim), dtype=dtype
+        )
+
+        sample = self.decode(noise, target_mask)
+        return sample
