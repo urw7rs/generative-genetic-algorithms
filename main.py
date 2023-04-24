@@ -30,7 +30,7 @@ def train_vae(
     if model_config is None:
         model_config = vae.models.TransformerConfig()
 
-    ds = humanml3d.load_vae(loop_config, data_config)
+    ds = humanml3d.load_motion(loop_config, data_config)
     train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
 
     n_devices = jax.local_device_count()

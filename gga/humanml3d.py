@@ -65,7 +65,7 @@ class HumanML3DConfig:
     max_length: int = 196
 
 
-def load_vae(
+def load_motion(
     loop_config: vae.train.LoopConfig, config: HumanML3DConfig
 ) -> tf.data.Dataset:
     train_ds, eval_ds = tfds.load("humanml3d", split=["train", "val"])
@@ -114,6 +114,78 @@ def load_vae(
                 loop_config.batch_size,
                 padded_shapes={
                     "motion": (config.max_length, None),
+                },
+                drop_remainder=True,
+            )
+            .prefetch(AUTOTUNE)
+        )
+        return ds
+
+    train_ds = norm_and_batch(train_ds, shuffle=True)
+    eval_ds = norm_and_batch(eval_ds, shuffle=False)
+
+    ds = {
+        "train": train_ds,
+        "val": eval_ds,
+    }
+
+    return ds
+
+
+def load_motion_text(
+    loop_config: vae.train.LoopConfig, config: HumanML3DConfig
+) -> tf.data.Dataset:
+    train_ds, eval_ds = tfds.load("humanml3d", split=["train", "val"])
+
+    def load_dataset(ds):
+        ds = ds.filter(
+            lambda batch: tf.math.reduce_any(
+                tf.logical_and(
+                    tf.math.greater_equal(batch["length"], config.min_length),
+                    tf.math.less_equal(batch["length"], config.max_length),
+                )
+            )
+        )
+        return ds
+
+    train_ds, eval_ds = [load_dataset(ds) for ds in [train_ds, eval_ds]]
+
+    motion_ds = train_ds.map(lambda x: x["motion"], num_parallel_calls=AUTOTUNE)
+
+    mean = calc_mean(motion_ds)
+    std = calc_std(motion_ds, mean)
+
+    def norm_and_batch(ds, shuffle: bool):
+        ds = ds.map(
+            functools.partial(normalize, mean=mean, std=std),
+            num_parallel_calls=AUTOTUNE,
+        )
+        ds = ds.map(
+            lambda x: {
+                "motion": x["motion"],
+                "text": tf.expand_dims(x["caption"], axis=0),
+            },
+            num_parallel_calls=AUTOTUNE,
+        )
+
+        num_samples = 0
+        for batch in ds:
+            num_samples += 1
+
+        count = loop_config.total_steps // num_samples
+        if loop_config.total_steps % num_samples > 0:
+            count += 1
+
+        if shuffle:
+            ds = ds.shuffle(num_samples, reshuffle_each_iteration=True)
+
+        ds = (
+            ds.repeat(count * loop_config.batch_size)
+            .padded_batch(
+                loop_config.batch_size,
+                padded_shapes={
+                    "motion": (config.max_length, None),
+                    "text": (1,),
                 },
                 drop_remainder=True,
             )
