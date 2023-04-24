@@ -68,7 +68,7 @@ def mse_loss(preds, target):
     return ((preds - target) ** 2).mean()
 
 
-def train_step(state, batch, config, dropout_rng=None):
+def train_step(state, batch, config, dropout_rng=None, noise_rng=None):
     """Perform a single training step."""
     # X_position and X_segmentation are needed only when using "packed examples"
     # where multiple sequences are packed into the same example with this
@@ -80,29 +80,30 @@ def train_step(state, batch, config, dropout_rng=None):
     targets = inputs
 
     dropout_rng = jax.random.fold_in(dropout_rng, state.step)
+    noise_rng = jax.random.fold_in(noise_rng, state.step)
 
     def loss_fn(params):
         """loss function used for training."""
-        predicted = models.Transformer(config).apply(
+        recons, mu, logvar, noise = models.Transformer(config).apply(
             {"params": params},
             inputs,
             targets,
-            rngs={"dropout": dropout_rng},
+            rngs={"dropout": dropout_rng, "noise": noise_rng},
         )
 
-        loss = mse_loss(predicted, targets)
-        return loss, predicted
+        loss = mse_loss(recons, targets)
+        return loss, recons
 
     if state.dynamic_scale:
         # dynamic scale takes care of averaging gradients across replicas
         grad_fn = state.dynamic_scale.value_and_grad(
             loss_fn, has_aux=True, axis_name="device"
         )
-        dynamic_scale, is_fin, (loss, predicted), grads = grad_fn(state.params)
+        dynamic_scale, is_fin, (loss, recons), grads = grad_fn(state.params)
         state = state.replace(dynamic_scale=dynamic_scale)
     else:
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss, predicted), grads = grad_fn(state.params)
+        (loss, recons), grads = grad_fn(state.params)
         grads = jax.lax.pmean(grads, axis_name="device")
 
     loss = jax.lax.pmean(loss, axis_name="device")
@@ -124,27 +125,28 @@ def train_step(state, batch, config, dropout_rng=None):
     return logs, new_state
 
 
-def eval_step(state, batch, config, dropout_rng=None):
+def eval_step(state, batch, config, dropout_rng=None, noise_rng=None):
     """Calculate evaluation metrics on a batch."""
     eval_keys = ["motion"]
     (inputs,) = (batch.get(k, None) for k in eval_keys)
     targets = inputs
 
     dropout_rng = jax.random.fold_in(dropout_rng, state.step)
+    noise_rng = jax.random.fold_in(noise_rng, state.step)
 
     def loss_fn(params):
         """loss function used for training."""
-        predicted = models.Transformer(config).apply(
+        recons, mu, logvar, noise = models.Transformer(config).apply(
             {"params": params},
             inputs,
             targets,
-            rngs={"dropout": dropout_rng},
+            rngs={"dropout": dropout_rng, "noise": noise_rng},
         )
 
-        loss = mse_loss(predicted, targets)
-        return loss, predicted
+        loss = mse_loss(recons, targets)
+        return loss, recons
 
-    loss, predicted = loss_fn(state.params)
+    loss, recons = loss_fn(state.params)
     loss = jax.lax.pmean(loss, axis_name="device")
 
     logs = ciclo.logs()
@@ -194,20 +196,20 @@ def create_state(
     m = models.Transformer(eval_config)
 
     rng = jax.random.PRNGKey(seed)
-    rng, init_rng = jax.random.split(rng)
+    rng, init_rng, noise_rng = jax.random.split(rng, 3)
     input_shape = (
         per_device_batch_size,
-        train_config.max_len,
+        train_config.max_len - train_config.latent_length * 2,
         train_config.input_size,
     )
     target_shape = (
         per_device_batch_size,
-        train_config.max_len,
+        train_config.max_len - train_config.latent_length * 2,
         train_config.output_size,
     )
 
     initial_variables = jax.jit(m.init)(
-        init_rng,
+        {"params": init_rng, "noise": noise_rng},
         jnp.ones(input_shape, jnp.float32),
         jnp.ones(target_shape, jnp.float32),
     )
@@ -248,7 +250,9 @@ def train_loop(
     state = jax_utils.replicate(state)
 
     rng = jax.random.PRNGKey(seed)
-    dropout_rngs = jax.random.split(rng, jax.local_device_count())
+    rng, dropout_rng, noise_rng = jax.random.split(rng, 3)
+    dropout_rngs = jax.random.split(dropout_rng, jax.local_device_count())
+    noise_rngs = jax.random.split(noise_rng, jax.local_device_count())
 
     # compile multidevice versions of train/eval/predict step and cache init fn.
     p_train_step = jax.pmap(
@@ -286,7 +290,9 @@ def train_loop(
         train_ds.as_numpy_iterator(), stop=loop_config.total_steps
     ):
         batch = common_utils.shard(batch)
-        new_logs, state = p_train_step(state, batch, dropout_rng=dropout_rngs)
+        new_logs, state = p_train_step(
+            state, batch, dropout_rng=dropout_rngs, noise_rng=noise_rngs
+        )
         logs.updates = jax.tree_map(lambda x: x[0], new_logs)
 
         if call_writer(elapsed):
@@ -306,7 +312,7 @@ def train_loop(
 
                 batch = common_utils.shard(batch)
                 eval_logs.updates, state = p_eval_step(
-                    state, batch, dropout_rng=dropout_rngs
+                    state, batch, dropout_rng=dropout_rngs, noise_rng=noise_rngs
                 )
                 eval_history.commit(eval_elapsed, eval_logs)
 

@@ -3,6 +3,7 @@ from typing import Callable, Any, Optional
 from flax import linen as nn
 from flax import struct
 from jax import lax
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -13,8 +14,9 @@ class TransformerConfig:
 
     input_size: int = 263
     output_size: int = 263
+    latent_length: int = 7
     share_embeddings: bool = False
-    logits_via_embedding: bool = False
+    recons_via_embedding: bool = False
     dtype: Any = jnp.float32
     emb_dim: int = 256
     num_heads: int = 4
@@ -79,7 +81,7 @@ class AddPositionEmbs(nn.Module):
     decode: bool = False
 
     @nn.compact
-    def __call__(self, inputs, inputs_positions=None):
+    def __call__(self, inputs):
         """Applies AddPositionEmbs module.
 
         By default this layer uses a fixed sinusoidal embedding table. If a
@@ -88,7 +90,6 @@ class AddPositionEmbs(nn.Module):
 
         Args:
           inputs: input data.
-          inputs_positions: input position indices for packed sequences.
 
         Returns:
           output: `(bs, timesteps, in_dim)`
@@ -122,12 +123,7 @@ class AddPositionEmbs(nn.Module):
                 cache_index.value = i + 1
                 _, _, df = pos_embedding.shape
                 pe = lax.dynamic_slice(pos_embedding, jnp.array((0, i, 0)), (1, 1, df))
-        if inputs_positions is None:
-            # normal unpacked case:
-            return inputs + pe
-        else:
-            # for packed data we need to use known position indices:
-            return inputs + jnp.take(pe[0], inputs_positions, axis=0)
+        return inputs + pe
 
 
 class MlpBlock(nn.Module):
@@ -291,12 +287,11 @@ class Encoder(nn.Module):
     shared_embedding: Any = None
 
     @nn.compact
-    def __call__(self, inputs, inputs_positions=None, encoder_mask=None):
+    def __call__(self, inputs, encoder_mask=None):
         """Applies Transformer model on the inputs.
 
         Args:
           inputs: input data
-          inputs_positions: input subsequence positions for packed examples.
           encoder_mask: decoder self-attention mask.
 
         Returns:
@@ -315,9 +310,15 @@ class Encoder(nn.Module):
         else:
             input_embed = self.shared_embedding
         x = input_embed(inputs)
-        x = AddPositionEmbs(config=config, decode=False, name="posembed_input")(
-            x, inputs_positions=inputs_positions
+
+        dist_tokens = self.param(
+            "dist_tokens",
+            nn.initializers.zeros,
+            (1, config.latent_length * 2, config.emb_dim),
         )
+        dist_tokens = jnp.tile(dist_tokens, [x.shape[0], 1, 1])
+        x = jnp.concatenate([dist_tokens, x], axis=1)
+        x = AddPositionEmbs(config=config, decode=False, name="posembed_input")(x)
         x = nn.Dropout(rate=config.dropout_rate)(x, deterministic=config.deterministic)
 
         x = x.astype(config.dtype)
@@ -329,8 +330,9 @@ class Encoder(nn.Module):
             )
 
         encoded = nn.LayerNorm(dtype=config.dtype, name="encoder_norm")(x)
-
-        return encoded
+        dist_tokens = encoded[:, : dist_tokens.shape[1]]
+        mu, logvar = jnp.split(dist_tokens, 2, axis=1)
+        return mu, logvar
 
 
 class Decoder(nn.Module):
@@ -349,7 +351,6 @@ class Decoder(nn.Module):
         self,
         encoded,
         targets,
-        targets_positions=None,
         decoder_mask=None,
         encoder_decoder_mask=None,
     ):
@@ -358,7 +359,6 @@ class Decoder(nn.Module):
         Args:
           encoded: encoded input data from encoder.
           targets: target inputs.
-          targets_positions: input subsequence positions for packed examples.
           decoder_mask: decoder self-attention mask.
           encoder_decoder_mask: encoder-decoder attention mask.
 
@@ -383,11 +383,11 @@ class Decoder(nn.Module):
         if not config.decode:
             y = shift_right(targets)
         else:
-            y = targets
+            y = jnp.zeros_like(targets)
         y = output_embed(y)
         y = AddPositionEmbs(
             config=config, decode=config.decode, name="posembed_output"
-        )(y, inputs_positions=targets_positions)
+        )(y)
         y = nn.Dropout(rate=config.dropout_rate)(y, deterministic=config.deterministic)
 
         y = y.astype(config.dtype)
@@ -403,20 +403,20 @@ class Decoder(nn.Module):
         y = nn.LayerNorm(dtype=config.dtype, name="encoderdecoder_norm")(y)
 
         # Decoded Logits
-        if config.logits_via_embedding:
+        if config.recons_via_embedding:
             # Use the transpose of embedding matrix for logit transform.
             logits = output_embed.attend(y.astype(jnp.float32))
             # Correctly normalize pre-softmax logits for this shared case.
             logits = logits / jnp.sqrt(y.shape[-1])
         else:
-            logits = nn.Dense(
+            recons = nn.Dense(
                 config.output_size,
                 dtype=config.dtype,
                 kernel_init=config.kernel_init,
                 bias_init=config.bias_init,
                 name="logitdense",
             )(y)
-        return logits
+        return recons
 
 
 def get_mask(x):
@@ -431,6 +431,7 @@ class Transformer(nn.Module):
     """
 
     config: TransformerConfig
+    rng_collection: str = "noise"
 
     def setup(self):
         config = self.config
@@ -451,13 +452,11 @@ class Transformer(nn.Module):
         self.encoder = Encoder(config=config, shared_embedding=self.shared_embedding)
         self.decoder = Decoder(config=config, shared_embedding=self.shared_embedding)
 
-    def encode(self, inputs, inputs_positions=None, inputs_segmentation=None):
+    def encode(self, inputs):
         """Applies Transformer encoder-branch on the inputs.
 
         Args:
           inputs: input data.
-          inputs_positions: input subsequence positions for packed examples.
-          inputs_segmentation: input segmentation info for packed examples.
 
         Returns:
           encoded feature array from the transformer encoder.
@@ -465,45 +464,34 @@ class Transformer(nn.Module):
         config = self.config
         # Make padding attention mask.
         input_mask = get_mask(inputs)
+        input_mask = jnp.concatenate(
+            [
+                jnp.ones((inputs.shape[0], config.latent_length * 2)),
+                input_mask,
+            ],
+            axis=1,
+        )
         encoder_mask = nn.make_attention_mask(
             input_mask, input_mask, dtype=config.dtype
         )
-        # Add segmentation block-diagonal attention mask if using segmented data.
-        if inputs_segmentation is not None:
-            encoder_mask = nn.combine_masks(
-                encoder_mask,
-                nn.make_attention_mask(
-                    inputs_segmentation,
-                    inputs_segmentation,
-                    jnp.equal,
-                    dtype=config.dtype,
-                ),
-            )
-        return self.encoder(
-            inputs, inputs_positions=inputs_positions, encoder_mask=encoder_mask
-        )
+        return self.encoder(inputs, encoder_mask=encoder_mask), input_mask
 
     def decode(
         self,
         encoded,
-        inputs,  # only needed for masks
         targets,
-        targets_positions=None,
-        inputs_segmentation=None,
-        targets_segmentation=None,
     ):
         """Applies Transformer decoder-branch on encoded-input and target.
 
         Args:
           encoded: encoded input data from encoder.
-          inputs: input data (only needed for masking).
           targets: target data.
-          targets_positions: target subsequence positions for packed examples.
-          inputs_segmentation: input segmentation info for packed examples.
-          targets_segmentation: target segmentation info for packed examples.
 
         Returns:
-          logits array from transformer decoder.
+          reconstructed array from transformer decoder.
+          latent mean
+          latent log variance
+          noise used to sample latent
         """
         config = self.config
 
@@ -511,82 +499,52 @@ class Transformer(nn.Module):
         if config.decode:
             # for fast autoregressive decoding only a special encoder-decoder mask is used
             decoder_mask = None
-            input_mask = get_mask(inputs)
+            encoded_mask = jnp.ones((encoded.shape[0], encoded.shape[1]))
             encoder_decoder_mask = nn.make_attention_mask(
-                jnp.ones_like(targets) > 0, input_mask, dtype=config.dtype
+                get_mask(targets), encoded_mask, dtype=config.dtype
             )
         else:
             target_mask = get_mask(targets)
+            encoded_mask = jnp.ones((encoded.shape[0], encoded.shape[1]))
             decoder_mask = nn.make_attention_mask(
-                target_mask, target_mask, dtype=config.dtype
+                target_mask,
+                target_mask,
+                dtype=config.dtype,
             )
-            input_mask = get_mask(inputs)
             encoder_decoder_mask = nn.make_attention_mask(
-                target_mask, input_mask, dtype=config.dtype
+                target_mask, encoded_mask, dtype=config.dtype
             )
 
-        # Add segmentation block-diagonal attention masks if using segmented data.
-        if inputs_segmentation is not None:
-            decoder_mask = nn.combine_masks(
-                decoder_mask,
-                nn.make_attention_mask(
-                    targets_segmentation,
-                    targets_segmentation,
-                    jnp.equal,
-                    dtype=config.dtype,
-                ),
-            )
-            encoder_decoder_mask = nn.combine_masks(
-                encoder_decoder_mask,
-                nn.make_attention_mask(
-                    targets_segmentation,
-                    inputs_segmentation,
-                    jnp.equal,
-                    dtype=config.dtype,
-                ),
-            )
-        logits = self.decoder(
+        reconstructed = self.decoder(
             encoded,
             targets,
-            targets_positions=targets_positions,
             decoder_mask=decoder_mask,
             encoder_decoder_mask=encoder_decoder_mask,
         )
-        return logits.astype(self.config.dtype)
+        return reconstructed.astype(self.config.dtype)
 
     def __call__(
         self,
         inputs,
         targets,
-        inputs_positions=None,
-        targets_positions=None,
-        inputs_segmentation=None,
-        targets_segmentation=None,
     ):
         """Applies Transformer model on the inputs.
 
         Args:
           inputs: input data.
           targets: target data.
-          inputs_positions: input subsequence positions for packed examples.
-          targets_positions: target subsequence positions for packed examples.
-          inputs_segmentation: input segmentation info for packed examples.
-          targets_segmentation: target segmentation info for packed examples.
 
         Returns:
-          logits array from full transformer.
+          reconstructed array from full transformer.
         """
-        encoded = self.encode(
-            inputs,
-            inputs_positions=inputs_positions,
-            inputs_segmentation=inputs_segmentation,
-        )
+        (mu, logvar), input_mask = self.encode(inputs)
 
-        return self.decode(
-            encoded,
-            inputs,  # only used for masks
-            targets,
-            targets_positions=targets_positions,
-            inputs_segmentation=inputs_segmentation,
-            targets_segmentation=targets_segmentation,
-        )
+        std = jnp.exp(0.5 * logvar)
+
+        rng = self.make_rng(self.rng_collection)
+        noise = jax.random.normal(rng, mu.shape, dtype=mu.dtype)
+        sampled_latent = std * noise + mu
+
+        recons = self.decode(sampled_latent, targets)  # only used for masks
+        # recons = recons.at[~input_mask].set(jnp.zeros_like(recons[input_mask]))
+        return recons, mu, logvar, noise
