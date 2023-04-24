@@ -67,13 +67,7 @@ class HumanML3DConfig:
 
 def length_mask(length, max_length):
     idx = tf.range(max_length, dtype=length.dtype)
-
-    mask = tf.where(
-        idx < length,
-        tf.ones_like(idx),
-        tf.zeros_like(idx),
-    )
-
+    mask = idx < length
     return mask
 
 
