@@ -1,14 +1,18 @@
 from typing import Optional
 from pathlib import Path
+import functools
 
 from jsonargparse import CLI
 
 import numpy as onp
 
-import jax
-from flax.training import checkpoints
-
 import tensorflow as tf
+
+import jax
+
+from flax import jax_utils
+from flax.training import checkpoints
+from flax.training import common_utils
 
 from gga import vae
 from gga import humanml3d
@@ -102,16 +106,42 @@ def plot_skeletons(
         assert workdir is not None, "Speicfy checkpoint dir in workdir"
         state = checkpoints.restore_checkpoint(workdir, state)
 
-    batch = next(iter(eval_ds.as_numpy_iterator()))
+    state = jax_utils.replicate(state)
 
-    motion: onp.ndarray = batch["motion"]
-    motion = motion * ds["std"] + ds["mean"]
-    batched_text: onp.ndarray = batch["text"]
+    rng = jax.random.PRNGKey(seed)
+    rng, dropout_rng, noise_rng = jax.random.split(rng, 3)
+    dropout_rngs = jax.random.split(dropout_rng, jax.local_device_count())
+    noise_rngs = jax.random.split(noise_rng, jax.local_device_count())
 
-    batched_positions = onp.array(jax.jit(smpl.recover_from_ric)(motion))
-    for i, (positions, text) in enumerate(zip(batched_positions, batched_text)):
-        text = text[0].decode()
-        plot_smpl.plot_skeleton(f"{i}.gif", positions, text, fps=20)
+    p_generate_step = jax.pmap(
+        functools.partial(vae.train.generate_step, config=model_config),
+        axis_name="device",
+    )
+
+    mean = jax_utils.replicate(ds["mean"])
+    std = jax_utils.replicate(ds["std"])
+
+    for batch in eval_ds.as_numpy_iterator():
+        batched_text: onp.ndarray = batch.pop("text")
+
+        batch = common_utils.shard(batch)
+
+        positions = p_generate_step(
+            state,
+            batch,
+            mean=mean,
+            std=std,
+            dropout_rng=dropout_rngs,
+            noise_rng=noise_rngs,
+        )[0]
+
+        positions = onp.array(positions)
+
+        for i, (pos, text) in enumerate(zip(positions, batched_text)):
+            text = text[0].decode()
+            plot_smpl.plot_skeleton(f"{i}.gif", pos, text, fps=20)
+
+        break
 
 
 if __name__ == "__main__":

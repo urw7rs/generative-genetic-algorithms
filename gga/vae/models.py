@@ -523,7 +523,7 @@ class Transformer(nn.Module):
             encoder_decoder_mask=encoder_decoder_mask,
         )
 
-        reconstructed = jnp.expand_dims(target_mask, axis=-1) * reconstructed
+        reconstructed = reconstructed * jnp.expand_dims(target_mask, axis=-1)
         return reconstructed.astype(self.config.dtype)
 
     def __call__(

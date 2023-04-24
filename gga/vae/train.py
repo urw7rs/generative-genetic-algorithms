@@ -23,6 +23,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from torch.utils.tensorboard import SummaryWriter
 
 from . import models
+from gga import smpl
 
 
 TFDS = tf.data.Dataset
@@ -124,6 +125,27 @@ def train_step(state, batch, config, dropout_rng=None, noise_rng=None):
     return logs, new_state
 
 
+def generate_samples(state, batch, config, dropout_rng=None, noise_rng=None):
+    eval_keys = ["mask"]
+    (input_mask,) = (batch.get(k, None) for k in eval_keys)
+
+    motion = models.Transformer(config).apply(
+        {"params": state.params},
+        input_mask,
+        config.dtype,
+        rngs={"dropout": dropout_rng, "noise": noise_rng},
+        method="generate",
+    )
+    return motion
+
+
+def generate_step(state, batch, mean, std, config, dropout_rng=None, noise_rng=None):
+    motion = generate_samples(state, batch, config, dropout_rng, noise_rng)
+    motion = motion * std + mean
+    joints = smpl.recover_from_ric(motion)
+    return joints
+
+
 def eval_step(state, batch, config, dropout_rng=None, noise_rng=None):
     """Calculate evaluation metrics on a batch."""
     eval_keys = ["motion", "mask"]
@@ -144,20 +166,11 @@ def eval_step(state, batch, config, dropout_rng=None, noise_rng=None):
         loss = mse_loss(recons, inputs)
         return loss, recons
 
-    def generate_samples(params):
-        return models.Transformer(config).apply(
-            {"params": params},
-            input_mask,
-            config.dtype,
-            rngs={"dropout": dropout_rng, "noise": noise_rng},
-            method="generate",
-        )
-
     loss, recons = loss_fn(state.params)
     loss = jax.lax.pmean(loss, axis_name="device")
 
     # TODO: compute metrics using generated samples
-    samples = generate_samples(state.params)
+    # samples = generate_samples(state.params)
 
     logs = ciclo.logs()
     logs.add_metric("recons_loss", loss)
@@ -349,3 +362,7 @@ def train_loop(
     writer.close()
 
     return state, history
+
+
+def generate_loop():
+    ...
