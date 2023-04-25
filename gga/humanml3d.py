@@ -165,12 +165,8 @@ def load_motion_text(
 
     def norm_and_batch(ds, shuffle: bool):
         ds = ds.map(
-            functools.partial(normalize, mean=mean, std=std),
-            num_parallel_calls=AUTOTUNE,
-        )
-        ds = ds.map(
             lambda x: {
-                "motion": x["motion"],
+                "motion": normalize(x["motion"], mean=mean, std=std),
                 "text": tf.expand_dims(x["caption"], axis=0),
                 "mask": length_mask(x["length"], max_length=config.max_length),
             },
