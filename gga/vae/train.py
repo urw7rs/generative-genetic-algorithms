@@ -65,11 +65,15 @@ def create_learning_rate_schedule(learning_rate: float, warmup_steps: int):
     )
 
 
+def kl_divergence(mean, logvar):
+    return -0.5 * jnp.mean(1 + logvar - jnp.square(mean) - jnp.exp(logvar))
+
+
 def mse_loss(preds, target):
     return ((preds - target) ** 2).mean()
 
 
-def train_step(state, batch, config, dropout_rng=None, noise_rng=None):
+def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None):
     """Perform a single training step."""
     # X_position and X_segmentation are needed only when using "packed examples"
     # where multiple sequences are packed into the same example with this
@@ -91,23 +95,42 @@ def train_step(state, batch, config, dropout_rng=None, noise_rng=None):
             rngs={"dropout": dropout_rng, "noise": noise_rng},
         )
 
-        loss = mse_loss(recons, inputs)
-        return loss, recons
+        gt_pos = smpl.recover_from_ric(inputs * std + mean)
+        pos = smpl.recover_from_ric(recons * std + mean)
+
+        pos_recons_loss = mse_loss(pos, gt_pos)
+        recons_loss = mse_loss(recons, inputs)
+        kl_loss = kl_divergence(mu, logvar) * 1e-4
+
+        loss = recons_loss + pos_recons_loss + kl_loss
+
+        return loss, (pos_recons_loss, recons_loss, kl_loss, recons)
 
     if state.dynamic_scale:
         # dynamic scale takes care of averaging gradients across replicas
         grad_fn = state.dynamic_scale.value_and_grad(
             loss_fn, has_aux=True, axis_name="device"
         )
-        dynamic_scale, is_fin, (loss, recons), grads = grad_fn(state.params)
+        (
+            dynamic_scale,
+            is_fin,
+            (loss, (pos_recons_loss, recons_loss, kl_loss, recons)),
+            grads,
+        ) = grad_fn(state.params)
         state = state.replace(dynamic_scale=dynamic_scale)
     else:
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss, recons), grads = grad_fn(state.params)
+        (loss, (pos_recons_loss, recons_loss, kl_loss, recons)), grads = grad_fn(
+            state.params
+        )
         grads = jax.lax.pmean(grads, axis_name="device")
 
-    loss = jax.lax.pmean(loss, axis_name="device")
     new_state = state.apply_gradients(grads=grads)
+
+    loss = jax.lax.pmean(loss, axis_name="device")
+    recons_loss = jax.lax.pmean(recons_loss, axis_name="device")
+    pos_recons_loss = jax.lax.pmean(pos_recons_loss, axis_name="device")
+    kl_loss = jax.lax.pmean(kl_loss, axis_name="device")
 
     if state.dynamic_scale:
         # if is_fin == False the gradients contain Inf/NaNs and optimizer state and
@@ -121,7 +144,10 @@ def train_step(state, batch, config, dropout_rng=None, noise_rng=None):
         )
 
     logs = ciclo.logs()
-    logs.add_metric("train/recons_loss", loss)
+    logs.add_metric("train/recons_loss", recons_loss)
+    logs.add_metric("train/pos_recons_loss", pos_recons_loss)
+    logs.add_metric("train/kl_loss", kl_loss)
+    logs.add_metric("train/loss", loss)
     return logs, new_state
 
 
@@ -163,7 +189,7 @@ def reconstruct(state, batch, mean, std, config, dropout_rng=None, noise_rng=Non
     return joints
 
 
-def eval_step(state, batch, config, dropout_rng=None, noise_rng=None):
+def eval_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None):
     """Calculate evaluation metrics on a batch."""
     eval_keys = ["motion", "mask"]
     (inputs, input_mask) = (batch.get(k, None) for k in eval_keys)
@@ -180,17 +206,31 @@ def eval_step(state, batch, config, dropout_rng=None, noise_rng=None):
             rngs={"dropout": dropout_rng, "noise": noise_rng},
         )
 
-        loss = mse_loss(recons, inputs)
-        return loss, recons
+        gt_pos = smpl.recover_from_ric(inputs * std + mean)
+        pos = smpl.recover_from_ric(recons * std + mean)
 
-    loss, recons = loss_fn(state.params)
+        pos_recons_loss = mse_loss(pos, gt_pos)
+        recons_loss = mse_loss(recons, inputs)
+        kl_loss = kl_divergence(mu, logvar) * 1e-4
+
+        loss = recons_loss + pos_recons_loss + kl_loss
+
+        return loss, (pos_recons_loss, recons_loss, kl_loss, recons)
+
+    loss, (pos_recons_loss, recons_loss, kl_loss, recons) = loss_fn(state.params)
     loss = jax.lax.pmean(loss, axis_name="device")
+    recons_loss = jax.lax.pmean(recons_loss, axis_name="device")
+    pos_recons_loss = jax.lax.pmean(pos_recons_loss, axis_name="device")
+    kl_loss = jax.lax.pmean(kl_loss, axis_name="device")
 
     # TODO: compute metrics using generated samples
     # samples = generate_samples(state.params, batch, config, dropout_rng, noise_rng)
 
     logs = ciclo.logs()
-    logs.add_metric("recons_loss", loss)
+    logs.add_metric("recons_loss", recons_loss)
+    logs.add_metric("pos_recons_loss", pos_recons_loss)
+    logs.add_metric("kl_loss", kl_loss)
+    logs.add_metric("loss", loss)
     return logs, state
 
 
@@ -282,6 +322,8 @@ def train_loop(
     state: TrainState,
     train_ds: TFDS,
     eval_ds: TFDS,
+    mean,
+    std,
     loop_config: LoopConfig,
     config: models.TransformerConfig,
 ):
@@ -330,7 +372,12 @@ def train_loop(
     ):
         batch = common_utils.shard(batch)
         new_logs, state = p_train_step(
-            state, batch, dropout_rng=dropout_rngs, noise_rng=noise_rngs
+            state,
+            batch,
+            mean=mean,
+            std=std,
+            dropout_rng=dropout_rngs,
+            noise_rng=noise_rngs,
         )
         logs.updates = jax.tree_map(lambda x: x[0], new_logs)
 
@@ -351,20 +398,20 @@ def train_loop(
 
                 batch = common_utils.shard(batch)
                 eval_logs.updates, state = p_eval_step(
-                    state, batch, dropout_rng=dropout_rngs, noise_rng=noise_rngs
+                    state,
+                    batch,
+                    mean=mean,
+                    std=std,
+                    dropout_rng=dropout_rngs,
+                    noise_rng=noise_rngs,
                 )
                 eval_history.commit(eval_elapsed, eval_logs)
 
-            key = "recons_loss"
-            recon_loss = onp.stack(eval_history.collect(key)).mean(axis=0)
-            metrics = {key: recon_loss}
-
-            metrics = jax.tree_map(lambda x: x[0], metrics)
-
-            logs.add_metric("val/recons_loss", metrics[key])
-
             step = int(state.step[0])
-            writer.add_scalar(f"val/{key}", onp.asarray(metrics[key]), step)
+            for key in eval_logs["metrics"].keys():
+                metric = onp.stack(eval_history.collect(key)).mean(axis=0)[0]
+                logs.add_metric(f"val/{key}", metric)
+                writer.add_scalar(f"val/{key}", onp.asarray(metric), step)
 
             single_state = jax.tree_util.tree_map(lambda x: x[0], state)
             checkpoint_best(elapsed, single_state, logs)

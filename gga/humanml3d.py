@@ -54,9 +54,8 @@ def calc_std(motion_ds, mean: np.ndarray, num_joints: int = 22):
     return std
 
 
-def normalize(batch, mean, std):
-    batch["motion"] = (batch["motion"] - mean) / std
-    return batch
+def normalize(x, mean, std):
+    return (x - mean) / std
 
 
 @dataclasses.dataclass
@@ -96,11 +95,8 @@ def load_motion(
 
     def norm_and_batch(ds, shuffle: bool):
         ds = ds.map(
-            functools.partial(normalize, mean=mean, std=std),
-            num_parallel_calls=AUTOTUNE,
-        ).map(
             lambda x: {
-                "motion": x["motion"],
+                "motion": normalize(x["motion"], mean=mean, std=std),
                 "mask": length_mask(x["length"], max_length=config.max_length),
             },
             num_parallel_calls=AUTOTUNE,

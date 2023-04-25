@@ -1,11 +1,13 @@
 from typing import Callable, Any, Optional
 
-from flax import linen as nn
-from flax import struct
 from jax import lax
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from flax import linen as nn
+from flax import struct
+from flax.linen.initializers import Initializer
 
 
 @struct.dataclass
@@ -30,7 +32,7 @@ class TransformerConfig:
     decode: bool = False
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
-    posemb_init: Optional[Callable] = None
+    posemb_init: Optional[Initializer] = None
 
 
 def shift_right(x, axis=1):

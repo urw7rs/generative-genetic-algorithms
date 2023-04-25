@@ -4,38 +4,34 @@ import functools
 
 from jsonargparse import CLI
 
-import numpy as onp
-
-import tensorflow as tf
-
 import jax
 
 from flax import jax_utils
 from flax.training import checkpoints
 from flax.training import common_utils
 
+import numpy as onp
+
+import tensorflow as tf
+
 from gga import vae
 from gga import humanml3d
 from gga import plot_smpl
 
+HumanML3DConfig = humanml3d.HumanML3DConfig
+LoopConfig = vae.train.LoopConfig
+TransformerConfig = vae.models.TransformerConfig
+
 
 def train_vae(
-    seed: int = 0,
-    use_mixed_precision: bool = True,
-    restore_checkpoints: bool = False,
-    workdir: Optional[Path] = None,
-    data_config: Optional[humanml3d.HumanML3DConfig] = None,
-    loop_config: Optional[vae.train.LoopConfig] = None,
-    model_config: Optional[vae.models.TransformerConfig] = None,
+    seed: int,
+    use_mixed_precision: bool,
+    data_config: HumanML3DConfig,
+    loop_config: LoopConfig,
+    checkpoint: Optional[Path] = None,
 ):
-    if data_config is None:
-        data_config = humanml3d.HumanML3DConfig()
-
-    if loop_config is None:
-        loop_config = vae.train.LoopConfig()
-
-    if model_config is None:
-        model_config = vae.models.TransformerConfig()
+    print(data_config)
+    print(loop_config)
 
     ds = humanml3d.load_motion(loop_config, data_config)
     train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
@@ -45,6 +41,7 @@ def train_vae(
         loop_config.batch_size % n_devices == 0
     ), "batch size must be divisable by number of devices"
 
+    model_config = TransformerConfig()
     state: vae.train.TrainState = vae.train.create_state(
         seed,
         use_mixed_precision,
@@ -53,38 +50,31 @@ def train_vae(
         loop_config,
     )
 
-    if restore_checkpoints:
-        assert workdir is not None, "Speicfy checkpoint dir in workdir"
-        state = checkpoints.restore_checkpoint(workdir, state)
+    if checkpoint is not None:
+        state = checkpoints.restore_checkpoint(checkpoint, state)
+
+    mean = jax_utils.replicate(ds["mean"])
+    std = jax_utils.replicate(ds["std"])
 
     state, history = vae.train.train_loop(
         seed,
         state,
         train_ds,
         eval_ds,
+        mean,
+        std,
         loop_config,
         model_config,
     )
 
 
 def plot_skeletons(
-    seed: int = 0,
-    use_mixed_precision: bool = True,
-    restore_checkpoints: bool = False,
-    workdir: Optional[Path] = None,
-    data_config: Optional[humanml3d.HumanML3DConfig] = None,
-    loop_config: Optional[vae.train.LoopConfig] = None,
-    model_config: Optional[vae.models.TransformerConfig] = None,
+    seed: int,
+    use_mixed_precision: bool,
+    data_config: HumanML3DConfig,
+    loop_config: LoopConfig,
+    checkpoint: Optional[Path] = None,
 ):
-    if data_config is None:
-        data_config = humanml3d.HumanML3DConfig()
-
-    if loop_config is None:
-        loop_config = vae.train.LoopConfig()
-
-    if model_config is None:
-        model_config = vae.models.TransformerConfig()
-
     ds = humanml3d.load_motion_text(loop_config, data_config)
     train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
 
@@ -93,6 +83,7 @@ def plot_skeletons(
         loop_config.batch_size % n_devices == 0
     ), "batch size must be divisable by number of devices"
 
+    model_config = TransformerConfig()
     state: vae.train.TrainState = vae.train.create_state(
         seed,
         use_mixed_precision,
@@ -101,9 +92,8 @@ def plot_skeletons(
         loop_config,
     )
 
-    if restore_checkpoints:
-        assert workdir is not None, "Speicfy checkpoint dir in workdir"
-        state = checkpoints.restore_checkpoint(workdir, state)
+    if checkpoint is not None:
+        state = checkpoints.restore_checkpoint(checkpoint, state)
 
     state = jax_utils.replicate(state)
 
@@ -148,23 +138,12 @@ def plot_skeletons(
 
 
 def plot_skeletons_recons(
-    seed: int = 0,
-    use_mixed_precision: bool = True,
-    restore_checkpoints: bool = False,
-    workdir: Optional[Path] = None,
-    data_config: Optional[humanml3d.HumanML3DConfig] = None,
-    loop_config: Optional[vae.train.LoopConfig] = None,
-    model_config: Optional[vae.models.TransformerConfig] = None,
+    seed: int,
+    use_mixed_precision: bool,
+    data_config: HumanML3DConfig,
+    loop_config: LoopConfig,
+    checkpoint: Optional[Path] = None,
 ):
-    if data_config is None:
-        data_config = humanml3d.HumanML3DConfig()
-
-    if loop_config is None:
-        loop_config = vae.train.LoopConfig()
-
-    if model_config is None:
-        model_config = vae.models.TransformerConfig()
-
     ds = humanml3d.load_motion_text(loop_config, data_config)
     train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
 
@@ -173,6 +152,7 @@ def plot_skeletons_recons(
         loop_config.batch_size % n_devices == 0
     ), "batch size must be divisable by number of devices"
 
+    model_config = TransformerConfig()
     state: vae.train.TrainState = vae.train.create_state(
         seed,
         use_mixed_precision,
@@ -181,9 +161,8 @@ def plot_skeletons_recons(
         loop_config,
     )
 
-    if restore_checkpoints:
-        assert workdir is not None, "Speicfy checkpoint dir in workdir"
-        state = checkpoints.restore_checkpoint(workdir, state)
+    if checkpoint is not None:
+        state = checkpoints.restore_checkpoint(checkpoint, state)
 
     state = jax_utils.replicate(state)
 
