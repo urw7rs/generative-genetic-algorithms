@@ -147,6 +147,22 @@ def generate_step(state, batch, mean, std, config, dropout_rng=None, noise_rng=N
     return joints
 
 
+def reconstruct(state, batch, mean, std, config, dropout_rng=None, noise_rng=None):
+    inputs = batch["motion"]
+    input_mask = batch["mask"]
+
+    recons, mu, logvar, noise = models.Transformer(config).apply(
+        {"params": state.params},
+        inputs,
+        input_mask,
+        rngs={"dropout": dropout_rng, "noise": noise_rng},
+    )
+    motion = recons * std + mean
+    joints = smpl.recover_from_ric(motion)
+    joints *= batch["mask"][:, :, None, None]
+    return joints
+
+
 def eval_step(state, batch, config, dropout_rng=None, noise_rng=None):
     """Calculate evaluation metrics on a batch."""
     eval_keys = ["motion", "mask"]
