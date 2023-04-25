@@ -22,8 +22,8 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 
 from torch.utils.tensorboard import SummaryWriter
 
-from . import models
 from gga import smpl
+from . import models
 
 
 TFDS = tf.data.Dataset
@@ -143,6 +143,7 @@ def generate_step(state, batch, mean, std, config, dropout_rng=None, noise_rng=N
     motion = generate_samples(state, batch, config, dropout_rng, noise_rng)
     motion = motion * std + mean
     joints = smpl.recover_from_ric(motion)
+    joints *= batch["mask"][:, :, None, None]
     return joints
 
 
@@ -170,7 +171,7 @@ def eval_step(state, batch, config, dropout_rng=None, noise_rng=None):
     loss = jax.lax.pmean(loss, axis_name="device")
 
     # TODO: compute metrics using generated samples
-    # samples = generate_samples(state.params)
+    # samples = generate_samples(state.params, batch, config, dropout_rng, noise_rng)
 
     logs = ciclo.logs()
     logs.add_metric("recons_loss", loss)
