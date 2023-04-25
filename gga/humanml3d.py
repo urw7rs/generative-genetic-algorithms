@@ -182,7 +182,7 @@ def load_motion_text(
         )
 
         num_samples = 0
-        for batch in ds:
+        for _ in ds:
             num_samples += 1
 
         count = loop_config.total_steps // num_samples
