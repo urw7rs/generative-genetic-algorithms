@@ -121,7 +121,7 @@ def plot_skeletons(
     mean = jax_utils.replicate(ds["mean"])
     std = jax_utils.replicate(ds["std"])
 
-    for batch in eval_ds.as_numpy_iterator():
+    for batch in train_ds.as_numpy_iterator():
         batched_text: onp.ndarray = batch.pop("text")
 
         batch = common_utils.shard(batch)
@@ -134,12 +134,16 @@ def plot_skeletons(
             dropout_rng=dropout_rngs,
             noise_rng=noise_rngs,
         )[0]
+        mask = batch["mask"][0]
 
         positions = onp.array(positions)
+        batched_mask = onp.array(mask)
 
-        for i, (pos, text) in enumerate(zip(positions, batched_text)):
+        for i, (pos, mask, text) in enumerate(
+            zip(positions, batched_mask, batched_text)
+        ):
             text = text[0].decode()
-            plot_smpl.plot_skeleton(f"{i}.gif", pos, text, fps=20)
+            plot_smpl.plot_skeleton(f"{i}.gif", pos[mask], text, fps=20)
 
         break
 
