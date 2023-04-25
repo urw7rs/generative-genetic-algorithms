@@ -4,6 +4,8 @@ import functools
 
 from jsonargparse import CLI
 
+from rich.console import Console
+
 import jax
 
 from flax import jax_utils
@@ -30,31 +32,35 @@ def train_vae(
     loop_config: LoopConfig,
     checkpoint: Optional[Path] = None,
 ):
-    print(data_config)
-    print(loop_config)
+    console = Console()
 
-    ds = humanml3d.load_motion(loop_config, data_config)
-    train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
+    with console.status("preparing...") as status:
+        ds = humanml3d.load_motion(loop_config, data_config)
+        train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
 
-    n_devices = jax.local_device_count()
-    assert (
-        loop_config.batch_size % n_devices == 0
-    ), "batch size must be divisable by number of devices"
+        console.log("dataset ready")
 
-    model_config = TransformerConfig()
-    state: vae.train.TrainState = vae.train.create_state(
-        seed,
-        use_mixed_precision,
-        loop_config.batch_size // n_devices,
-        model_config,
-        loop_config,
-    )
+        n_devices = jax.local_device_count()
+        assert (
+            loop_config.batch_size % n_devices == 0
+        ), "batch size must be divisable by number of devices"
 
-    if checkpoint is not None:
-        state = checkpoints.restore_checkpoint(checkpoint, state)
+        model_config = TransformerConfig()
+        state: vae.train.TrainState = vae.train.create_state(
+            seed,
+            use_mixed_precision,
+            loop_config.batch_size // n_devices,
+            model_config,
+            loop_config,
+        )
+        console.log("model ready")
 
-    mean = jax_utils.replicate(ds["mean"])
-    std = jax_utils.replicate(ds["std"])
+        if checkpoint is not None:
+            state = checkpoints.restore_checkpoint(checkpoint, state)
+            console.log("checkpoint loaded")
+
+        mean = jax_utils.replicate(ds["mean"])
+        std = jax_utils.replicate(ds["std"])
 
     state, history = vae.train.train_loop(
         seed,
@@ -75,66 +81,75 @@ def plot_skeletons(
     loop_config: LoopConfig,
     checkpoint: Optional[Path] = None,
 ):
-    ds = humanml3d.load_motion_text(loop_config, data_config)
-    train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
+    console = Console()
 
-    n_devices = jax.local_device_count()
-    assert (
-        loop_config.batch_size % n_devices == 0
-    ), "batch size must be divisable by number of devices"
+    with console.status("preparing...") as status:
+        ds = humanml3d.load_motion_text(loop_config, data_config)
+        train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
 
-    model_config = TransformerConfig()
-    state: vae.train.TrainState = vae.train.create_state(
-        seed,
-        use_mixed_precision,
-        loop_config.batch_size // n_devices,
-        model_config,
-        loop_config,
-    )
+        console.log("dataset ready")
 
-    if checkpoint is not None:
-        state = checkpoints.restore_checkpoint(checkpoint, state)
+        n_devices = jax.local_device_count()
+        assert (
+            loop_config.batch_size % n_devices == 0
+        ), "batch size must be divisable by number of devices"
 
-    state = jax_utils.replicate(state)
+        model_config = TransformerConfig()
+        state: vae.train.TrainState = vae.train.create_state(
+            seed,
+            use_mixed_precision,
+            loop_config.batch_size // n_devices,
+            model_config,
+            loop_config,
+        )
 
-    rng = jax.random.PRNGKey(seed)
-    rng, dropout_rng, noise_rng = jax.random.split(rng, 3)
-    dropout_rngs = jax.random.split(dropout_rng, jax.local_device_count())
-    noise_rngs = jax.random.split(noise_rng, jax.local_device_count())
+        console.log("model ready")
 
-    p_generate_step = jax.pmap(
-        functools.partial(vae.train.generate_step, config=model_config),
-        axis_name="device",
-    )
+        if checkpoint is not None:
+            state = checkpoints.restore_checkpoint(checkpoint, state)
+            console.log("checkpoint loaded")
 
-    mean = jax_utils.replicate(ds["mean"])
-    std = jax_utils.replicate(ds["std"])
+        state = jax_utils.replicate(state)
 
-    for batch in train_ds.as_numpy_iterator():
-        batched_text: onp.ndarray = batch.pop("text")
+        rng = jax.random.PRNGKey(seed)
+        rng, dropout_rng, noise_rng = jax.random.split(rng, 3)
+        dropout_rngs = jax.random.split(dropout_rng, jax.local_device_count())
+        noise_rngs = jax.random.split(noise_rng, jax.local_device_count())
 
-        batch = common_utils.shard(batch)
+        p_generate_step = jax.pmap(
+            functools.partial(vae.train.generate_step, config=model_config),
+            axis_name="device",
+        )
 
-        positions = p_generate_step(
-            state,
-            batch,
-            mean=mean,
-            std=std,
-            dropout_rng=dropout_rngs,
-            noise_rng=noise_rngs,
-        )[0]
-        mask = batch["mask"][0]
+        mean = jax_utils.replicate(ds["mean"])
+        std = jax_utils.replicate(ds["std"])
 
-        positions = onp.array(positions)
-        batched_mask = onp.array(mask)
+    with console.status("plotting...") as status:
+        for batch in train_ds.as_numpy_iterator():
+            batched_text: onp.ndarray = batch.pop("text")
 
-        for i, (pos, mask, text) in enumerate(
-            zip(positions, batched_mask, batched_text)
-        ):
-            text = text[0].decode()
-            plot_smpl.plot_skeleton(f"{i}.gif", pos[mask], text, fps=20)
+            batch = common_utils.shard(batch)
 
-        break
+            positions = p_generate_step(
+                state,
+                batch,
+                mean=mean,
+                std=std,
+                dropout_rng=dropout_rngs,
+                noise_rng=noise_rngs,
+            )[0]
+            mask = batch["mask"][0]
+
+            positions = onp.array(positions)
+            batched_mask = onp.array(mask)
+
+            for pos, mask, text in zip(positions, batched_mask, batched_text):
+                text = text[0].decode()
+                file_name = "{text}.gif"
+                plot_smpl.plot_skeleton(file_name, pos[mask], text, fps=20)
+                console.log(f"saved {file_name}")
+
+            break
 
 
 def plot_skeletons_recons(
@@ -144,66 +159,76 @@ def plot_skeletons_recons(
     loop_config: LoopConfig,
     checkpoint: Optional[Path] = None,
 ):
-    ds = humanml3d.load_motion_text(loop_config, data_config)
-    train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
+    console = Console()
 
-    n_devices = jax.local_device_count()
-    assert (
-        loop_config.batch_size % n_devices == 0
-    ), "batch size must be divisable by number of devices"
+    with console.status("preparing...") as status:
+        ds = humanml3d.load_motion_text(loop_config, data_config)
+        train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
+        console.log("dataset ready")
 
-    model_config = TransformerConfig()
-    state: vae.train.TrainState = vae.train.create_state(
-        seed,
-        use_mixed_precision,
-        loop_config.batch_size // n_devices,
-        model_config,
-        loop_config,
-    )
+        n_devices = jax.local_device_count()
+        assert (
+            loop_config.batch_size % n_devices == 0
+        ), "batch size must be divisable by number of devices"
 
-    if checkpoint is not None:
-        state = checkpoints.restore_checkpoint(checkpoint, state)
+        model_config = TransformerConfig()
+        state: vae.train.TrainState = vae.train.create_state(
+            seed,
+            use_mixed_precision,
+            loop_config.batch_size // n_devices,
+            model_config,
+            loop_config,
+        )
 
-    state = jax_utils.replicate(state)
+        console.log("model ready")
 
-    rng = jax.random.PRNGKey(seed)
-    rng, dropout_rng, noise_rng = jax.random.split(rng, 3)
-    dropout_rngs = jax.random.split(dropout_rng, jax.local_device_count())
-    noise_rngs = jax.random.split(noise_rng, jax.local_device_count())
+        if checkpoint is not None:
+            state = checkpoints.restore_checkpoint(checkpoint, state)
+            console.log("loaded checkpoint")
 
-    p_reconstruct = jax.pmap(
-        functools.partial(vae.train.reconstruct, config=model_config),
-        axis_name="device",
-    )
+        state = jax_utils.replicate(state)
 
-    mean = jax_utils.replicate(ds["mean"])
-    std = jax_utils.replicate(ds["std"])
+        rng = jax.random.PRNGKey(seed)
+        rng, dropout_rng, noise_rng = jax.random.split(rng, 3)
+        dropout_rngs = jax.random.split(dropout_rng, jax.local_device_count())
+        noise_rngs = jax.random.split(noise_rng, jax.local_device_count())
 
-    for batch in train_ds.as_numpy_iterator():
-        batched_text: onp.ndarray = batch.pop("text")
+        p_reconstruct = jax.pmap(
+            functools.partial(vae.train.reconstruct, config=model_config),
+            axis_name="device",
+        )
 
-        batch = common_utils.shard(batch)
+        mean = jax_utils.replicate(ds["mean"])
+        std = jax_utils.replicate(ds["std"])
 
-        positions = p_reconstruct(
-            state,
-            batch,
-            mean=mean,
-            std=std,
-            dropout_rng=dropout_rngs,
-            noise_rng=noise_rngs,
-        )[0]
-        mask = batch["mask"][0]
+    with console.status("plotting...") as status:
+        for batch in train_ds.as_numpy_iterator():
+            batched_text: onp.ndarray = batch.pop("text")
 
-        positions = onp.array(positions)
-        batched_mask = onp.array(mask)
+            batch = common_utils.shard(batch)
 
-        for i, (pos, mask, text) in enumerate(
-            zip(positions, batched_mask, batched_text)
-        ):
-            text = text[0].decode()
-            plot_smpl.plot_skeleton(f"{i}.gif", pos[mask], text, fps=20)
+            positions = p_reconstruct(
+                state,
+                batch,
+                mean=mean,
+                std=std,
+                dropout_rng=dropout_rngs,
+                noise_rng=noise_rngs,
+            )[0]
+            mask = batch["mask"][0]
 
-        break
+            positions = onp.array(positions)
+            batched_mask = onp.array(mask)
+
+            for i, (pos, mask, text) in enumerate(
+                zip(positions, batched_mask, batched_text)
+            ):
+                text = text[0].decode()
+                file_name = f"recons_{text}.gif"
+                plot_smpl.plot_skeleton(file_name, pos[mask], text, fps=20)
+                console.log(f"saved {file_name}")
+
+            break
 
 
 if __name__ == "__main__":
