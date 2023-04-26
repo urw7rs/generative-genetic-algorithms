@@ -66,7 +66,7 @@ def create_learning_rate_schedule(learning_rate: float, warmup_steps: int):
 
 
 def kl_divergence(mean, logvar):
-    return -0.5 * jnp.mean(1 + logvar - jnp.square(mean) - jnp.exp(logvar))
+    return -0.5 * (1 + logvar - jnp.square(mean) - jnp.exp(logvar))
 
 
 def mse_loss(preds, target):
@@ -104,9 +104,9 @@ def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None
         gt_pos = smpl.recover_from_ric(inputs * std + mean)
         pos = smpl.recover_from_ric(recons * std + mean)
 
-        pos_recons_loss = smooth_l1_loss(pos, gt_pos)
-        recons_loss = smooth_l1_loss(recons, inputs)
-        kl_loss = kl_divergence(mu, logvar) * 1e-4
+        pos_recons_loss = smooth_l1_loss(pos, gt_pos).mean()
+        recons_loss = smooth_l1_loss(recons, inputs).mean()
+        kl_loss = kl_divergence(mu, logvar).mean() * 1e-4
 
         loss = recons_loss + pos_recons_loss + kl_loss
 
@@ -214,9 +214,9 @@ def eval_step(state, batch, config, mean, std, noise_rng=None):
         gt_pos = smpl.recover_from_ric(inputs * std + mean)
         pos = smpl.recover_from_ric(recons * std + mean)
 
-        pos_recons_loss = smooth_l1_loss(pos, gt_pos)
-        recons_loss = smooth_l1_loss(recons, inputs)
-        kl_loss = kl_divergence(mu, logvar) * 1e-4
+        pos_recons_loss = smooth_l1_loss(pos, gt_pos).mean()
+        recons_loss = smooth_l1_loss(recons, inputs).mean()
+        kl_loss = kl_divergence(mu, logvar).mean() * 1e-4
 
         loss = recons_loss + pos_recons_loss + kl_loss
 
