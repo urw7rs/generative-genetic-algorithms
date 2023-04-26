@@ -112,12 +112,12 @@ def plot_skeletons(
         state = jax_utils.replicate(state)
 
         rng = jax.random.PRNGKey(seed)
-        rng, dropout_rng, noise_rng = jax.random.split(rng, 3)
-        dropout_rngs = jax.random.split(dropout_rng, jax.local_device_count())
+        rng, noise_rng = jax.random.split(rng)
         noise_rngs = jax.random.split(noise_rng, jax.local_device_count())
 
+        eval_config = model_config.replace(deterministic=True)
         p_generate_step = jax.pmap(
-            functools.partial(vae.train.generate_step, config=model_config),
+            functools.partial(vae.train.generate_step, config=eval_config),
             axis_name="device",
         )
 
@@ -135,7 +135,6 @@ def plot_skeletons(
                 batch,
                 mean=mean,
                 std=std,
-                dropout_rng=dropout_rngs,
                 noise_rng=noise_rngs,
             )[0]
             mask = batch["mask"][0]
@@ -145,7 +144,7 @@ def plot_skeletons(
 
             for pos, mask, text in zip(positions, batched_mask, batched_text):
                 text = text[0].decode()
-                file_name = "{text}.gif"
+                file_name = f"{text}.gif"
                 plot_smpl.plot_skeleton(file_name, pos[mask], text, fps=20)
                 console.log(f"saved {file_name}")
 
@@ -189,12 +188,12 @@ def plot_skeletons_recons(
         state = jax_utils.replicate(state)
 
         rng = jax.random.PRNGKey(seed)
-        rng, dropout_rng, noise_rng = jax.random.split(rng, 3)
-        dropout_rngs = jax.random.split(dropout_rng, jax.local_device_count())
+        rng, noise_rng = jax.random.split(rng)
         noise_rngs = jax.random.split(noise_rng, jax.local_device_count())
 
+        eval_config = model_config.replace(deterministic=True)
         p_reconstruct = jax.pmap(
-            functools.partial(vae.train.reconstruct, config=model_config),
+            functools.partial(vae.train.reconstruct, config=eval_config),
             axis_name="device",
         )
 
@@ -212,7 +211,6 @@ def plot_skeletons_recons(
                 batch,
                 mean=mean,
                 std=std,
-                dropout_rng=dropout_rngs,
                 noise_rng=noise_rngs,
             )[0]
             mask = batch["mask"][0]
