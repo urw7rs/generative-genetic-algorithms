@@ -73,6 +73,12 @@ def mse_loss(preds, target):
     return ((preds - target) ** 2).mean()
 
 
+def smooth_l1_loss(preds, target, beta: float = 1.0):
+    l1 = jnp.abs(preds - target)
+    loss = jnp.where(l1 < beta, 0.5 / beta * l1**2, l1 - 0.5 / beta)
+    return loss
+
+
 def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None):
     """Perform a single training step."""
     # X_position and X_segmentation are needed only when using "packed examples"
@@ -98,8 +104,8 @@ def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None
         gt_pos = smpl.recover_from_ric(inputs * std + mean)
         pos = smpl.recover_from_ric(recons * std + mean)
 
-        pos_recons_loss = mse_loss(pos, gt_pos)
-        recons_loss = mse_loss(recons, inputs)
+        pos_recons_loss = smooth_l1_loss(pos, gt_pos)
+        recons_loss = smooth_l1_loss(recons, inputs)
         kl_loss = kl_divergence(mu, logvar) * 1e-4
 
         loss = recons_loss + pos_recons_loss + kl_loss
