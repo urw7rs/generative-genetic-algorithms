@@ -151,7 +151,7 @@ def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None
     return logs, new_state
 
 
-def generate_samples(state, batch, config, dropout_rng=None, noise_rng=None):
+def generate_samples(state, batch, config, noise_rng=None):
     eval_keys = ["mask"]
     (input_mask,) = (batch.get(k, None) for k in eval_keys)
 
@@ -159,21 +159,21 @@ def generate_samples(state, batch, config, dropout_rng=None, noise_rng=None):
         {"params": state.params},
         input_mask,
         config.dtype,
-        rngs={"dropout": dropout_rng, "noise": noise_rng},
+        rngs={"noise": noise_rng},
         method="generate",
     )
     return motion
 
 
-def generate_step(state, batch, mean, std, config, dropout_rng=None, noise_rng=None):
-    motion = generate_samples(state, batch, config, dropout_rng, noise_rng)
+def generate_step(state, batch, mean, std, config, noise_rng=None):
+    motion = generate_samples(state, batch, config, noise_rng)
     motion = motion * std + mean
     joints = smpl.recover_from_ric(motion)
     joints *= batch["mask"][:, :, None, None]
     return joints
 
 
-def reconstruct(state, batch, mean, std, config, dropout_rng=None, noise_rng=None):
+def reconstruct(state, batch, mean, std, config, noise_rng=None):
     inputs = batch["motion"]
     input_mask = batch["mask"]
 
@@ -181,7 +181,7 @@ def reconstruct(state, batch, mean, std, config, dropout_rng=None, noise_rng=Non
         {"params": state.params},
         inputs,
         input_mask,
-        rngs={"dropout": dropout_rng, "noise": noise_rng},
+        rngs={"noise": noise_rng},
     )
     motion = recons * std + mean
     joints = smpl.recover_from_ric(motion)
@@ -189,12 +189,11 @@ def reconstruct(state, batch, mean, std, config, dropout_rng=None, noise_rng=Non
     return joints
 
 
-def eval_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None):
+def eval_step(state, batch, config, mean, std, noise_rng=None):
     """Calculate evaluation metrics on a batch."""
     eval_keys = ["motion", "mask"]
     (inputs, input_mask) = (batch.get(k, None) for k in eval_keys)
 
-    dropout_rng = jax.random.fold_in(dropout_rng, state.step)
     noise_rng = jax.random.fold_in(noise_rng, state.step)
 
     def loss_fn(params):
@@ -203,14 +202,14 @@ def eval_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None)
             {"params": params},
             inputs,
             input_mask,
-            rngs={"dropout": dropout_rng, "noise": noise_rng},
+            rngs={"noise": noise_rng},
         )
 
         gt_pos = smpl.recover_from_ric(inputs * std + mean)
         pos = smpl.recover_from_ric(recons * std + mean)
 
-        pos_recons_loss = mse_loss(pos, gt_pos)
-        recons_loss = mse_loss(recons, inputs)
+        pos_recons_loss = smooth_l1_loss(pos, gt_pos)
+        recons_loss = smooth_l1_loss(recons, inputs)
         kl_loss = kl_divergence(mu, logvar) * 1e-4
 
         loss = recons_loss + pos_recons_loss + kl_loss
@@ -342,8 +341,9 @@ def train_loop(
         donate_argnums=(0,),
     )
 
+    eval_config = config.replace(deterministic=True)
     p_eval_step = jax.pmap(
-        functools.partial(eval_step, config=config),
+        functools.partial(eval_step, config=eval_config),
         axis_name="device",
         donate_argnums=(0,),
     )
@@ -402,7 +402,6 @@ def train_loop(
                     batch,
                     mean=mean,
                     std=std,
-                    dropout_rng=dropout_rngs,
                     noise_rng=noise_rngs,
                 )
                 eval_history.commit(eval_elapsed, eval_logs)
@@ -426,7 +425,3 @@ def train_loop(
     writer.close()
 
     return state, history
-
-
-def generate_loop():
-    ...
