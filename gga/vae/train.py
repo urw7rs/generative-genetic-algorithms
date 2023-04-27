@@ -254,12 +254,13 @@ class TrainState(train_state.TrainState):
 
 @dataclasses.dataclass
 class LoopConfig:
-    batch_size: int = 128
+    batch_size: int = 64
     eval_steps: int = 100
     total_steps: int = 600_000
     learning_rate: float = 1e-4
     weight_decay: float = 1e-7
     warmup_steps: int = 5000
+    grad_accum_steps: int = 2
 
 
 def create_state(
@@ -301,16 +302,23 @@ def create_state(
     if dtype == jnp.float16:
         dynamic_scale = dynamic_scale_lib.DynamicScale()
 
+    optimizer = optax.adamw(
+        learning_rate=learning_rate_fn,
+        b1=0.9,
+        b2=0.98,
+        eps=1e-9,
+        weight_decay=loop_config.weight_decay,
+    )
+
+    if loop_config.grad_accum_steps > 1:
+        optimizer = optax.MultiSteps(
+            optimizer, every_k_schedule=loop_config.grad_accum_steps
+        )
+
     state = TrainState.create(
         apply_fn=m.apply,
         params=initial_variables["params"],
-        tx=optax.adamw(
-            learning_rate=learning_rate_fn,
-            b1=0.9,
-            b2=0.98,
-            eps=1e-9,
-            weight_decay=loop_config.weight_decay,
-        ),
+        tx=optimizer,
         dynamic_scale=dynamic_scale,
     )
 
