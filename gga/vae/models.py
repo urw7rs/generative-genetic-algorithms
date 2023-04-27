@@ -22,7 +22,7 @@ class TransformerConfig:
     dtype: Any = jnp.float32
     emb_dim: int = 256
     num_heads: int = 4
-    num_layers: int = 7
+    num_layers: int = 9
     qkv_dim: int = 256
     mlp_dim: int = 1024
     max_len: int = 1024
@@ -150,7 +150,7 @@ class MlpBlock(nn.Module):
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
         )(inputs)
-        x = nn.relu(x)
+        x = nn.gelu(x)
         x = nn.Dropout(rate=config.dropout_rate)(x, deterministic=config.deterministic)
         output = nn.Dense(
             actual_out_dim,
@@ -301,6 +301,7 @@ class Encoder(nn.Module):
         """
         config = self.config
         assert inputs.ndim == 3  # (batch, len, features)
+        assert config.num_layers % 2 == 1
 
         # Input Embedding
         if self.shared_embedding is None:
@@ -326,10 +327,17 @@ class Encoder(nn.Module):
         x = x.astype(config.dtype)
 
         # Input Encoder
+        outputs = []
         for lyr in range(config.num_layers):
+            if lyr > config.num_layers // 2:
+                x = jnp.concatenate([x, outputs.pop()], axis=-1)
+
             x = Encoder1DBlock(config=config, name=f"encoderblock_{lyr}")(
                 x, encoder_mask
             )
+
+            if lyr < config.num_layers // 2:
+                outputs.append(x)
 
         encoded = nn.LayerNorm(dtype=config.dtype, name="encoder_norm")(x)
         dist_tokens = encoded[:, : dist_tokens.shape[1]]
@@ -371,6 +379,7 @@ class Decoder(nn.Module):
 
         assert encoded.ndim == 3  # (batch, len, depth)
         assert targets.ndim == 3  # (batch, len, depth)
+        assert config.num_layers % 2 == 1
 
         # Target Embedding
         if self.shared_embedding is None:
@@ -395,13 +404,21 @@ class Decoder(nn.Module):
         y = y.astype(config.dtype)
 
         # Target-Input Decoder
+        outputs = []
         for lyr in range(config.num_layers):
+            if lyr > config.num_layers // 2:
+                y = jnp.concatenate([y, outputs.pop()], axis=-1)
+
             y = EncoderDecoder1DBlock(config=config, name=f"encoderdecoderblock_{lyr}")(
                 y,
                 encoded,
                 decoder_mask=decoder_mask,
                 encoder_decoder_mask=encoder_decoder_mask,
             )
+
+            if lyr < config.num_layers // 2:
+                outputs.append(y)
+
         y = nn.LayerNorm(dtype=config.dtype, name="encoderdecoder_norm")(y)
 
         # Decoded Logits

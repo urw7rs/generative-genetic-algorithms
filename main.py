@@ -4,8 +4,6 @@ import functools
 
 from jsonargparse import CLI
 
-from rich.console import Console
-
 import jax
 
 from flax import jax_utils
@@ -19,6 +17,7 @@ import tensorflow as tf
 from gga import vae
 from gga import humanml3d
 from gga import plot_smpl
+from gga.console import console
 
 HumanML3DConfig = humanml3d.HumanML3DConfig
 LoopConfig = vae.train.LoopConfig
@@ -32,8 +31,6 @@ def train_vae(
     loop_config: LoopConfig,
     checkpoint: Optional[Path] = None,
 ):
-    console = Console()
-
     with console.status("preparing...") as status:
         ds = humanml3d.load_motion(loop_config, data_config)
         train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
@@ -62,6 +59,8 @@ def train_vae(
         mean = jax_utils.replicate(ds["mean"])
         std = jax_utils.replicate(ds["std"])
 
+    console._emoji_variant
+
     state, history = vae.train.train_loop(
         seed,
         state,
@@ -81,8 +80,6 @@ def plot_skeletons(
     loop_config: LoopConfig,
     checkpoint: Optional[Path] = None,
 ):
-    console = Console()
-
     with console.status("preparing...") as status:
         ds = humanml3d.load_motion_text(loop_config, data_config)
         train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
@@ -158,8 +155,6 @@ def plot_skeletons_recons(
     loop_config: LoopConfig,
     checkpoint: Optional[Path] = None,
 ):
-    console = Console()
-
     with console.status("preparing...") as status:
         ds = humanml3d.load_motion_text(loop_config, data_config)
         train_ds, eval_ds = [ds[key] for key in ["train", "val"]]

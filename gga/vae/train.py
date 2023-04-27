@@ -81,11 +81,6 @@ def smooth_l1_loss(preds, target, beta: float = 1.0):
 
 def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None):
     """Perform a single training step."""
-    # X_position and X_segmentation are needed only when using "packed examples"
-    # where multiple sequences are packed into the same example with this
-    # metadata.
-    # if such features are not present they are ignored and the example is treated
-    # like a normal, unpacked sequence example.
     train_keys = ["motion", "mask"]
     (inputs, input_mask) = (batch.get(k, None) for k in train_keys)
 
