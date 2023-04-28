@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import optax
 
 from flax import jax_utils
+from flax import struct
 from flax.training import common_utils
 from flax.training import train_state
 from flax.training import dynamic_scale as dynamic_scale_lib
@@ -79,6 +80,13 @@ def smooth_l1_loss(preds, target, beta: float = 1.0):
     return loss
 
 
+@struct.dataclass
+class Losses:
+    recons_loss: jax.Array
+    pos_recons_loss: jax.Array
+    kl_loss: jax.Array
+
+
 def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None):
     """Perform a single training step."""
     train_keys = ["motion", "mask"]
@@ -89,7 +97,7 @@ def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None
 
     def loss_fn(params):
         """loss function used for training."""
-        recons, mu, logvar, noise = models.Transformer(config).apply(
+        output = models.Transformer(config).apply(
             {"params": params},
             inputs,
             input_mask,
@@ -97,15 +105,15 @@ def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None
         )
 
         gt_pos = smpl.recover_from_ric(inputs * std + mean)
-        pos = smpl.recover_from_ric(recons * std + mean)
+        pos = smpl.recover_from_ric(output.recons * std + mean)
 
         pos_recons_loss = smooth_l1_loss(pos, gt_pos).mean()
-        recons_loss = smooth_l1_loss(recons, inputs).mean()
-        kl_loss = kl_divergence(mu, logvar).mean() * 1e-4
+        recons_loss = smooth_l1_loss(output.recons, inputs).mean()
+        kl_loss = kl_divergence(output.mu, output.logvar).mean() * 1e-4
 
         loss = recons_loss + pos_recons_loss + kl_loss
 
-        return loss, (pos_recons_loss, recons_loss, kl_loss, recons)
+        return loss, Losses(recons_loss, pos_recons_loss, kl_loss)
 
     if state.dynamic_scale:
         # dynamic scale takes care of averaging gradients across replicas
@@ -115,23 +123,21 @@ def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None
         (
             dynamic_scale,
             is_fin,
-            (loss, (pos_recons_loss, recons_loss, kl_loss, recons)),
+            (loss, losses),
             grads,
         ) = grad_fn(state.params)
         state = state.replace(dynamic_scale=dynamic_scale)
     else:
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss, (pos_recons_loss, recons_loss, kl_loss, recons)), grads = grad_fn(
-            state.params
-        )
+        (loss, losses), grads = grad_fn(state.params)
         grads = jax.lax.pmean(grads, axis_name="device")
 
     new_state = state.apply_gradients(grads=grads)
 
     loss = jax.lax.pmean(loss, axis_name="device")
-    recons_loss = jax.lax.pmean(recons_loss, axis_name="device")
-    pos_recons_loss = jax.lax.pmean(pos_recons_loss, axis_name="device")
-    kl_loss = jax.lax.pmean(kl_loss, axis_name="device")
+    recons_loss = jax.lax.pmean(losses.recons_loss, axis_name="device")
+    pos_recons_loss = jax.lax.pmean(losses.pos_recons_loss, axis_name="device")
+    kl_loss = jax.lax.pmean(losses.kl_loss, axis_name="device")
 
     if state.dynamic_scale:
         # if is_fin == False the gradients contain Inf/NaNs and optimizer state and
@@ -178,13 +184,13 @@ def reconstruct(state, batch, mean, std, config, noise_rng=None):
     inputs = batch["motion"]
     input_mask = batch["mask"]
 
-    recons, mu, logvar, noise = models.Transformer(config).apply(
+    output = models.Transformer(config).apply(
         {"params": state.params},
         inputs,
         input_mask,
         rngs={"noise": noise_rng},
     )
-    motion = recons * std + mean
+    motion = output.recons * std + mean
     joints = smpl.recover_from_ric(motion)
     joints *= batch["mask"][:, :, None, None]
     return joints
@@ -199,7 +205,7 @@ def eval_step(state, batch, config, mean, std, noise_rng=None):
 
     def loss_fn(params):
         """loss function used for training."""
-        recons, mu, logvar, noise = models.Transformer(config).apply(
+        output = models.Transformer(config).apply(
             {"params": params},
             inputs,
             input_mask,
@@ -207,21 +213,21 @@ def eval_step(state, batch, config, mean, std, noise_rng=None):
         )
 
         gt_pos = smpl.recover_from_ric(inputs * std + mean)
-        pos = smpl.recover_from_ric(recons * std + mean)
+        pos = smpl.recover_from_ric(output.recons * std + mean)
 
         pos_recons_loss = smooth_l1_loss(pos, gt_pos).mean()
-        recons_loss = smooth_l1_loss(recons, inputs).mean()
-        kl_loss = kl_divergence(mu, logvar).mean() * 1e-4
+        recons_loss = smooth_l1_loss(output.recons, inputs).mean()
+        kl_loss = kl_divergence(output.mu, output.logvar).mean() * 1e-4
 
         loss = recons_loss + pos_recons_loss + kl_loss
 
-        return loss, (pos_recons_loss, recons_loss, kl_loss, recons)
+        return loss, (Losses(recons_loss, pos_recons_loss, kl_loss), output)
 
-    loss, (pos_recons_loss, recons_loss, kl_loss, recons) = loss_fn(state.params)
+    loss, (losses, output) = loss_fn(state.params)
     loss = jax.lax.pmean(loss, axis_name="device")
-    recons_loss = jax.lax.pmean(recons_loss, axis_name="device")
-    pos_recons_loss = jax.lax.pmean(pos_recons_loss, axis_name="device")
-    kl_loss = jax.lax.pmean(kl_loss, axis_name="device")
+    recons_loss = jax.lax.pmean(losses.recons_loss, axis_name="device")
+    pos_recons_loss = jax.lax.pmean(losses.pos_recons_loss, axis_name="device")
+    kl_loss = jax.lax.pmean(losses.kl_loss, axis_name="device")
 
     # TODO: compute metrics using generated samples
     # samples = generate_samples(state.params, batch, config, dropout_rng, noise_rng)

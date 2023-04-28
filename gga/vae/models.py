@@ -1,4 +1,5 @@
 from typing import Callable, Any, Optional
+from jax.typing import ArrayLike
 
 from jax import lax
 import jax
@@ -8,6 +9,10 @@ import numpy as np
 from flax import linen as nn
 from flax import struct
 from flax.linen.initializers import Initializer
+
+
+CheckpointSelfAttention = nn.checkpoint(nn.SelfAttention)
+CheckpointMultiHeadDotProductAttention = nn.checkpoint(nn.MultiHeadDotProductAttention)
 
 
 @struct.dataclass
@@ -189,7 +194,7 @@ class Encoder1DBlock(nn.Module):
         # Attention block.
         assert inputs.ndim == 3
         x = nn.LayerNorm(dtype=config.dtype)(inputs)
-        x = nn.SelfAttention(
+        x = CheckpointSelfAttention(
             num_heads=config.num_heads,
             dtype=config.dtype,
             qkv_features=config.qkv_dim,
@@ -238,7 +243,7 @@ class EncoderDecoder1DBlock(nn.Module):
         # Decoder block.
         assert targets.ndim == 3
         x = nn.LayerNorm(dtype=config.dtype)(targets)
-        x = nn.SelfAttention(
+        x = CheckpointSelfAttention(
             num_heads=config.num_heads,
             dtype=config.dtype,
             qkv_features=config.qkv_dim,
@@ -255,7 +260,7 @@ class EncoderDecoder1DBlock(nn.Module):
 
         # Encoder-Decoder block.
         y = nn.LayerNorm(dtype=config.dtype)(x)
-        y = nn.MultiHeadDotProductAttention(
+        y = CheckpointMultiHeadDotProductAttention(
             num_heads=config.num_heads,
             dtype=config.dtype,
             qkv_features=config.qkv_dim,
@@ -275,6 +280,12 @@ class EncoderDecoder1DBlock(nn.Module):
         z = MlpBlock(config=config)(z)
 
         return y + z
+
+
+@struct.dataclass
+class EncoderOutput:
+    mu: jax.Array
+    logvar: jax.Array
 
 
 class Encoder(nn.Module):
@@ -342,7 +353,7 @@ class Encoder(nn.Module):
         encoded = nn.LayerNorm(dtype=config.dtype, name="encoder_norm")(x)
         dist_tokens = encoded[:, : dist_tokens.shape[1]]
         mu, logvar = jnp.split(dist_tokens, 2, axis=1)
-        return mu, logvar
+        return EncoderOutput(mu, logvar)
 
 
 class Decoder(nn.Module):
@@ -440,6 +451,14 @@ class Decoder(nn.Module):
 
 def get_mask(x):
     return jnp.sum(jnp.abs(x), axis=-1) != 0
+
+
+@struct.dataclass
+class TransformerOutput:
+    recons: jax.Array
+    mu: jax.Array
+    logvar: jax.Array
+    noise: jax.Array
 
 
 class Transformer(nn.Module):
@@ -549,7 +568,7 @@ class Transformer(nn.Module):
         self,
         inputs,
         input_mask,
-    ):
+    ) -> TransformerOutput:
         """Applies Transformer model on the inputs.
 
         Args:
@@ -559,7 +578,9 @@ class Transformer(nn.Module):
         Returns:
           reconstructed array from full transformer.
         """
-        mu, logvar = self.encode(inputs, input_mask)
+        output = self.encode(inputs, input_mask)
+        mu = output.mu
+        logvar = output.logvar
 
         std = jnp.exp(0.5 * logvar)
 
@@ -568,7 +589,7 @@ class Transformer(nn.Module):
         sampled_latent = std * noise + mu
 
         recons = self.decode(sampled_latent, input_mask)
-        return recons, mu, logvar, noise
+        return TransformerOutput(recons, mu, logvar, noise)
 
     def generate(self, target_mask, dtype=jnp.float32):
         rng = self.make_rng(self.rng_collection)
