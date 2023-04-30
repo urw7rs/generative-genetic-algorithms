@@ -2,8 +2,6 @@ from typing import Optional
 from pathlib import Path
 import functools
 
-from jsonargparse import CLI
-
 import jax
 
 from flax import jax_utils
@@ -13,6 +11,8 @@ from flax.training import common_utils
 import numpy as onp
 
 import tensorflow as tf
+
+from jsonargparse import CLI
 
 from gga import vae
 from gga import humanml3d
@@ -31,7 +31,7 @@ def train_vae(
     loop_config: LoopConfig,
     checkpoint: Optional[Path] = None,
 ):
-    with console.status("preparing...") as status:
+    with console.status("preparing..."):
         ds = humanml3d.load_motion(loop_config, data_config)
         train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
 
@@ -58,8 +58,6 @@ def train_vae(
 
         mean = jax_utils.replicate(ds["mean"])
         std = jax_utils.replicate(ds["std"])
-
-    console._emoji_variant
 
     state, history = vae.train.train_loop(
         seed,

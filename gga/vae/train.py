@@ -24,6 +24,8 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from torch.utils.tensorboard import SummaryWriter
 
 from gga import smpl
+from gga.metrics import ReconstructionMetrics
+
 from . import models
 
 
@@ -203,34 +205,35 @@ def eval_step(state, batch, config, mean, std, noise_rng=None):
 
     noise_rng = jax.random.fold_in(noise_rng, state.step)
 
-    def loss_fn(params):
-        """loss function used for training."""
-        output = models.Transformer(config).apply(
-            {"params": params},
-            inputs,
-            input_mask,
-            rngs={"noise": noise_rng},
-        )
+    output = models.Transformer(config).apply(
+        {"params": state.params},
+        inputs,
+        input_mask,
+        rngs={"noise": noise_rng},
+    )
 
-        gt_pos = smpl.recover_from_ric(inputs * std + mean)
-        pos = smpl.recover_from_ric(output.recons * std + mean)
+    encoded_recons = models.Transformer(config).apply(
+        {"params": state.params},
+        output.recons,
+        input_mask,
+        method="encode",
+    )
 
-        pos_recons_loss = smooth_l1_loss(pos, gt_pos).mean()
-        recons_loss = smooth_l1_loss(output.recons, inputs).mean()
-        kl_loss = kl_divergence(output.mu, output.logvar).mean() * 1e-4
+    gt_pos = smpl.recover_from_ric(inputs * std + mean)
+    pos = smpl.recover_from_ric(output.recons * std + mean)
 
-        loss = recons_loss + pos_recons_loss + kl_loss
+    pos_recons_loss = smooth_l1_loss(pos, gt_pos).mean()
+    recons_loss = smooth_l1_loss(output.recons, inputs).mean()
+    kl_loss = kl_divergence(output.mu, output.logvar).mean() * 1e-4
 
-        return loss, (Losses(recons_loss, pos_recons_loss, kl_loss), output)
+    loss = recons_loss + pos_recons_loss + kl_loss
 
-    loss, (losses, output) = loss_fn(state.params)
+    losses = Losses(recons_loss, pos_recons_loss, kl_loss)
+
     loss = jax.lax.pmean(loss, axis_name="device")
     recons_loss = jax.lax.pmean(losses.recons_loss, axis_name="device")
     pos_recons_loss = jax.lax.pmean(losses.pos_recons_loss, axis_name="device")
     kl_loss = jax.lax.pmean(losses.kl_loss, axis_name="device")
-
-    # TODO: compute metrics using generated samples
-    # samples = generate_samples(state.params, batch, config, dropout_rng, noise_rng)
 
     logs = ciclo.logs()
     logs.add_metric("recons_loss", recons_loss)
@@ -363,7 +366,7 @@ def train_loop(
         donate_argnums=(0,),
     )
 
-    call_checkpoint = ciclo.every(steps=1000)
+    call_checkpoint = ciclo.every(steps=1)
     checkpoint = ciclo.checkpoint(f"logdir/{Path(__file__).stem}/{int(time())}")
     checkpoint_best = ciclo.checkpoint(
         f"logdir/{Path(__file__).stem}/{int(time())}/best",
@@ -372,16 +375,17 @@ def train_loop(
         keep=3,
     )
 
-    call_eval = ciclo.every(10_000)
+    call_eval = ciclo.every(10_00)
     call_writer = ciclo.every(50)
 
-    # keras averages metrics by default set always_stateful to True to disable this behavior
-    keras_bar = ciclo.keras_bar(total=loop_config.total_steps, always_stateful=True)
     history = ciclo.history()
 
     writer = SummaryWriter()
 
     logs = ciclo.logs()
+    # keras averages metrics by default set always_stateful to True to disable this behavior
+    keras_bar = ciclo.keras_bar(total=loop_config.total_steps, always_stateful=True)
+
     for elapsed, batch in ciclo.elapse(
         train_ds.as_numpy_iterator(), stop=loop_config.total_steps
     ):
@@ -403,14 +407,17 @@ def train_loop(
                 if "val" not in key:
                     writer.add_scalar(key, onp.asarray(value), step)
 
+        keras_bar(elapsed, logs)
+        history.commit(elapsed, logs)
+
         if call_eval(elapsed):
             eval_history = ciclo.history()
+
+            eval_logs = ciclo.logs()
 
             for eval_elapsed, batch in ciclo.elapse(
                 eval_ds.as_numpy_iterator(), stop=loop_config.eval_steps
             ):
-                eval_logs = ciclo.logs()
-
                 batch = common_utils.shard(batch)
                 eval_logs.updates, state = p_eval_step(
                     state,
@@ -430,12 +437,9 @@ def train_loop(
             single_state = jax.tree_util.tree_map(lambda x: x[0], state)
             checkpoint_best(elapsed, single_state, logs)
 
-        if call_checkpoint(elapsed):
-            single_state = jax.tree_util.tree_map(lambda x: x[0], state)
-            checkpoint(elapsed, single_state, logs)
-
-        keras_bar(elapsed, logs)
-        history.commit(elapsed, logs)
+            if call_checkpoint(elapsed):
+                single_state = jax.tree_util.tree_map(lambda x: x[0], state)
+                checkpoint(elapsed, single_state, logs)
 
     writer.close()
 
