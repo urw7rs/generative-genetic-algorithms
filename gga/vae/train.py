@@ -375,7 +375,7 @@ def train_loop(
         keep=3,
     )
 
-    call_eval = ciclo.every(10_00)
+    call_eval = ciclo.every(10_000)
     call_writer = ciclo.every(50)
 
     history = ciclo.history()
