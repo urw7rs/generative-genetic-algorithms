@@ -1,9 +1,9 @@
-from typing import Any, Dict
-from jax.typing import ArrayLike
+from typing import Any, Dict, Mapping
 
-from time import time
 import functools
 from pathlib import Path
+
+from rich.progress import track
 
 import dataclasses
 
@@ -11,15 +11,22 @@ import numpy as onp
 
 import tensorflow as tf
 
-import ciclo
-
 import jax
 import jax.numpy as jnp
 
 import optax
+from orbax.checkpoint import checkpoint_utils
+from orbax.checkpoint import (
+    CheckpointManagerOptions,
+    CheckpointManager,
+    Checkpointer,
+    PyTreeCheckpointHandler,
+)
+
 
 from flax import jax_utils
 from flax import struct
+from flax.training import orbax_utils
 from flax.training import common_utils
 from flax.training import train_state
 from flax.training import dynamic_scale as dynamic_scale_lib
@@ -131,11 +138,11 @@ def train_step(state, batch, ds_info, config, dropout_rng=None, noise_rng=None):
             params=jax.tree_util.tree_map(select_fn, new_state.params, state.params),
         )
 
-    logs = ciclo.logs()
-    logs.add_metric("train/recons_loss", recons_loss)
-    logs.add_metric("train/pos_recons_loss", pos_recons_loss)
-    logs.add_metric("train/kl_loss", kl_loss)
-    logs.add_metric("train/loss", loss)
+    logs = {}
+    logs["train/recons_loss"] = recons_loss
+    logs["train/pos_recons_loss"] = pos_recons_loss
+    logs["train/kl_loss"] = kl_loss
+    logs["train/loss"] = loss
     return logs, new_state
 
 
@@ -212,11 +219,11 @@ def eval_step(state, batch, ds_info, config, noise_rng=None):
     pos_recons_loss = jax.lax.pmean(losses.pos_recons_loss, axis_name="device")
     kl_loss = jax.lax.pmean(losses.kl_loss, axis_name="device")
 
-    logs = ciclo.logs()
-    logs.add_metric("recons_loss", recons_loss)
-    logs.add_metric("pos_recons_loss", pos_recons_loss)
-    logs.add_metric("kl_loss", kl_loss)
-    logs.add_metric("loss", loss)
+    logs = {}
+    logs["recons_loss"] = recons_loss
+    logs["pos_recons_loss"] = pos_recons_loss
+    logs["kl_loss"] = kl_loss
+    logs["loss"] = loss
     return logs, state
 
 
@@ -242,7 +249,7 @@ class TrainState(train_state.TrainState):
 class LoopConfig:
     batch_size: int = 64
     eval_steps: int = 100
-    total_steps: int = 600_000
+    epochs: int = 6000
     learning_rate: float = 1e-4
     grad_accum_steps: int = 2
 
@@ -300,6 +307,7 @@ def create_state(
 
 
 def train_loop(
+    checkpoint: Path,
     seed: int,
     state: TrainState,
     train_ds: TFDS,
@@ -309,6 +317,18 @@ def train_loop(
     loop_config: LoopConfig,
     config: models.TransformerConfig,
 ):
+    def best_fn(metrics: Mapping[str, float]) -> float:
+        return metrics["recons_loss"]
+
+    options = CheckpointManagerOptions(max_to_keep=5, best_fn=best_fn, best_mode="min")
+
+    checkpoint_manager = CheckpointManager(
+        checkpoint, Checkpointer(PyTreeCheckpointHandler()), options
+    )
+
+    if checkpoint_manager.latest_step() is not None:
+        state = checkpoint_manager.restore(checkpoint_manager.latest_step())
+
     state = jax_utils.replicate(state)
 
     rng = jax.random.PRNGKey(seed)
@@ -329,79 +349,65 @@ def train_loop(
         donate_argnums=(0,),
     )
 
-    call_checkpoint = ciclo.every(steps=1)
-    checkpoint = ciclo.checkpoint(f"logdir/{Path(__file__).stem}/{int(time())}")
-    checkpoint_best = ciclo.checkpoint(
-        f"logdir/{Path(__file__).stem}/{int(time())}/best",
-        monitor="val/recons_loss",
-        mode="min",
-        keep=3,
-    )
-
-    call_eval = ciclo.every(10_000)
-    call_writer = ciclo.every(50)
-
-    history = ciclo.history()
-
     writer = SummaryWriter()
 
-    logs = ciclo.logs()
-    # keras averages metrics by default set always_stateful to True to disable this behavior
-    keras_bar = ciclo.keras_bar(total=loop_config.total_steps, always_stateful=True)
+    if checkpoint_manager.latest_step() is None:
+        step = 0
+    else:
+        step = checkpoint_manager.latest_step() + 1
 
-    for elapsed, batch in ciclo.elapse(
-        train_ds.as_numpy_iterator(), stop=loop_config.total_steps
+    steps_per_epoch = train_info["num_samples"] // loop_config.batch_size
+    total_steps = loop_config.epochs * steps_per_epoch - step
+
+    for batch in track(
+        train_ds.as_numpy_iterator(),
+        total=total_steps,
     ):
-        text = batch.pop("text")
+        batch.pop("text")
         batch = common_utils.shard(batch)
-        new_logs, state = p_train_step(
-            state,
-            batch,
-            dropout_rng=dropout_rngs,
-            noise_rng=noise_rngs,
+
+        logs, state = p_train_step(
+            state, batch, dropout_rng=dropout_rngs, noise_rng=noise_rngs
         )
-        logs.updates = jax.tree_map(lambda x: x[0], new_logs)
 
-        if call_writer(elapsed):
+        if step % 50 == 0:
             # state is replicated for each device
-            step = int(state.step[0])
-            for key, value in logs["metrics"].items():
+            for key, value in logs.items():
                 if "val" not in key:
-                    writer.add_scalar(key, onp.asarray(value), step)
+                    writer.add_scalar(key, onp.asarray(value[0]), step)
 
-        keras_bar(elapsed, logs)
-        history.commit(elapsed, logs)
-
-        if call_eval(elapsed):
-            eval_history = ciclo.history()
-
-            eval_logs = ciclo.logs()
-
-            for eval_elapsed, batch in ciclo.elapse(
-                eval_ds.as_numpy_iterator(), stop=loop_config.eval_steps
-            ):
-                text = batch.pop("text")
+        if step % 10_000 == 0:
+            eval_logs = {}
+            for batch in eval_ds.as_numpy_iterator():
+                batch.pop("text")
                 batch = common_utils.shard(batch)
-                eval_logs.updates, state = p_eval_step(
+
+                eval_log, state = p_eval_step(
                     state,
                     batch,
                     noise_rng=noise_rngs,
                 )
-                eval_history.commit(eval_elapsed, eval_logs)
 
-            step = int(state.step[0])
-            for key in eval_logs["metrics"].keys():
-                metric = onp.stack(eval_history.collect(key)).mean(axis=0)[0]
-                logs.add_metric(f"val/{key}", metric)
-                writer.add_scalar(f"val/{key}", onp.asarray(metric), step)
+                for key in eval_log.keys():
+                    if key not in eval_logs.keys():
+                        eval_logs[key] = []
 
-            single_state = jax.tree_util.tree_map(lambda x: x[0], state)
-            checkpoint_best(elapsed, single_state, logs)
+                    eval_logs[key].append(eval_log[key])
 
-            if call_checkpoint(elapsed):
-                single_state = jax.tree_util.tree_map(lambda x: x[0], state)
-                checkpoint(elapsed, single_state, logs)
+            metrics = {}
+            for key in eval_logs.keys():
+                metric = onp.stack(eval_logs[key]).mean(axis=0)
+                metrics[key] = metric[0].item()
+                writer.add_scalar(f"val/{key}", onp.asarray(metric[0]), step)
+
+            single_state = jax.tree_map(lambda x: x[0], state)
+            checkpoint_manager.save(step, single_state, metrics=metrics)
+
+        step += 1
+
+        if step > total_steps:
+            break
 
     writer.close()
 
-    return state, history
+    return state

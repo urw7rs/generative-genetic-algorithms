@@ -67,10 +67,7 @@ class HumanML3D:
         self.max_length = max_length
         self.tokenizer = tokenizer
 
-    def prepare(
-        self,
-        split,
-    ) -> tf.data.Dataset:
+    def prepare(self, split, shuffle: bool = True) -> tf.data.Dataset:
         ds: tf.data.Dataset = tfds.load("humanml3d", split=split, shuffle_files=True)
 
         ds = ds.filter(
@@ -87,7 +84,7 @@ class HumanML3D:
         mean = calc_mean(motion_ds)
         std = calc_std(motion_ds, mean)
 
-        def prepare(x):
+        def collate(x):
             batch = {
                 "motion": normalize(x["motion"], mean=mean, std=std),
                 "text": tf.expand_dims(x["caption"], axis=0),
@@ -98,38 +95,28 @@ class HumanML3D:
 
             return batch
 
-        ds = ds.map(prepare, num_parallel_calls=AUTOTUNE)
+        ds = ds.map(collate, num_parallel_calls=AUTOTUNE)
 
+        num_samples = 0
+        for _ in ds:
+            num_samples += 1
+
+        if shuffle:
+            ds = ds.shuffle(num_samples, reshuffle_each_iteration=True)
         info = {}
         info["mean"] = mean
         info["std"] = std
+        info["num_samples"] = num_samples
 
         return ds, info
 
     def batch(
         self,
         ds,
-        info,
         batch_size: int,
-        total_steps: Optional[int] = None,
         drop_remainder=False,
         shuffle=True,
     ):
-        num_samples = 0
-        for _ in ds:
-            num_samples += 1
-
-        ds = ds.shuffle(num_samples, reshuffle_each_iteration=True)
-
-        if total_steps is not None:
-            count = total_steps // num_samples
-            if total_steps % num_samples > 0:
-                count += 1
-
-            ds = ds.repeat(count * batch_size)
-
-            info["epochs"] = count
-
         ds = ds.padded_batch(
             batch_size,
             padded_shapes={
@@ -140,6 +127,4 @@ class HumanML3D:
             drop_remainder=drop_remainder,
         ).prefetch(AUTOTUNE)
 
-        info["length"] = num_samples
-
-        return ds, info
+        return ds
