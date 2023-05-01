@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 from pathlib import Path
 import functools
 
@@ -19,21 +19,37 @@ from gga import humanml3d
 from gga import plot_smpl
 from gga.console import console
 
-HumanML3DConfig = humanml3d.HumanML3DConfig
 LoopConfig = vae.train.LoopConfig
 TransformerConfig = vae.models.TransformerConfig
+
+
+def prepare_dataset(dataset: Any, batch_size, total_steps):
+    train_ds, train_info = dataset.prepare("train")
+    train_ds, train_info = dataset.batch(
+        train_ds,
+        train_info,
+        batch_size,
+        total_steps,
+        drop_remainder=True,
+    )
+
+    eval_ds, eval_info = dataset.prepare("train")
+    eval_ds, eval_info = dataset.batch(eval_ds, eval_info, batch_size, shuffle=False)
+
+    return train_ds, train_info, eval_ds, eval_info
 
 
 def train_vae(
     seed: int,
     use_mixed_precision: bool,
-    data_config: HumanML3DConfig,
+    dataset: Any,
     loop_config: LoopConfig,
     checkpoint: Optional[Path] = None,
 ):
     with console.status("preparing..."):
-        ds = humanml3d.load_motion(loop_config, data_config)
-        train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
+        train_ds, train_info, eval_ds, eval_info = prepare_dataset(
+            dataset, loop_config.batch_size, loop_config.total_steps
+        )
 
         console.log("dataset ready")
 
@@ -56,16 +72,13 @@ def train_vae(
             state = checkpoints.restore_checkpoint(checkpoint, state)
             console.log("checkpoint loaded")
 
-        mean = jax_utils.replicate(ds["mean"])
-        std = jax_utils.replicate(ds["std"])
-
     state, history = vae.train.train_loop(
         seed,
         state,
         train_ds,
+        train_info,
         eval_ds,
-        mean,
-        std,
+        eval_info,
         loop_config,
         model_config,
     )
@@ -74,13 +87,14 @@ def train_vae(
 def plot_skeletons(
     seed: int,
     use_mixed_precision: bool,
-    data_config: HumanML3DConfig,
+    dataset: Any,
     loop_config: LoopConfig,
     checkpoint: Optional[Path] = None,
 ):
-    with console.status("preparing...") as status:
-        ds = humanml3d.load_motion_text(loop_config, data_config)
-        train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
+    with console.status("preparing..."):
+        train_ds, train_info, eval_ds, eval_info = prepare_dataset(
+            dataset, loop_config.batch_size, loop_config.total_steps
+        )
 
         console.log("dataset ready")
 
@@ -112,26 +126,19 @@ def plot_skeletons(
 
         eval_config = model_config.replace(deterministic=True)
         p_generate_step = jax.pmap(
-            functools.partial(vae.train.generate_step, config=eval_config),
+            functools.partial(
+                vae.train.generate_step, ds_info=eval_info, config=eval_config
+            ),
             axis_name="device",
         )
 
-        mean = jax_utils.replicate(ds["mean"])
-        std = jax_utils.replicate(ds["std"])
-
-    with console.status("plotting...") as status:
-        for batch in train_ds.as_numpy_iterator():
+    with console.status("plotting..."):
+        for batch in eval_ds.as_numpy_iterator():
             batched_text: onp.ndarray = batch.pop("text")
 
             batch = common_utils.shard(batch)
 
-            positions = p_generate_step(
-                state,
-                batch,
-                mean=mean,
-                std=std,
-                noise_rng=noise_rngs,
-            )[0]
+            positions = p_generate_step(state, batch, noise_rng=noise_rngs)[0]
             mask = batch["mask"][0]
 
             positions = onp.array(positions)
@@ -149,13 +156,15 @@ def plot_skeletons(
 def plot_skeletons_recons(
     seed: int,
     use_mixed_precision: bool,
-    data_config: HumanML3DConfig,
+    dataset: Any,
     loop_config: LoopConfig,
     checkpoint: Optional[Path] = None,
 ):
-    with console.status("preparing...") as status:
-        ds = humanml3d.load_motion_text(loop_config, data_config)
-        train_ds, eval_ds = [ds[key] for key in ["train", "val"]]
+    with console.status("preparing..."):
+        train_ds, train_info, eval_ds, eval_info = prepare_dataset(
+            dataset, loop_config.batch_size, loop_config.total_steps
+        )
+
         console.log("dataset ready")
 
         n_devices = jax.local_device_count()
@@ -186,15 +195,14 @@ def plot_skeletons_recons(
 
         eval_config = model_config.replace(deterministic=True)
         p_reconstruct = jax.pmap(
-            functools.partial(vae.train.reconstruct, config=eval_config),
+            functools.partial(
+                vae.train.reconstruct, ds_info=eval_info, config=eval_config
+            ),
             axis_name="device",
         )
 
-        mean = jax_utils.replicate(ds["mean"])
-        std = jax_utils.replicate(ds["std"])
-
-    with console.status("plotting...") as status:
-        for batch in train_ds.as_numpy_iterator():
+    with console.status("plotting..."):
+        for batch in eval_ds.as_numpy_iterator():
             batched_text: onp.ndarray = batch.pop("text")
 
             batch = common_utils.shard(batch)
@@ -202,8 +210,6 @@ def plot_skeletons_recons(
             positions = p_reconstruct(
                 state,
                 batch,
-                mean=mean,
-                std=std,
                 noise_rng=noise_rngs,
             )[0]
             mask = batch["mask"][0]
@@ -226,4 +232,4 @@ if __name__ == "__main__":
     tf.random.set_seed(0)
     tf.config.set_visible_devices([], "GPU")
 
-    CLI()
+    CLI([train_vae, plot_skeletons, plot_skeletons_recons])

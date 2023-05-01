@@ -1,3 +1,6 @@
+from typing import Any, Dict
+from jax.typing import ArrayLike
+
 from time import time
 import functools
 from pathlib import Path
@@ -24,7 +27,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from torch.utils.tensorboard import SummaryWriter
 
 from gga import smpl
-from gga.metrics import ReconstructionMetrics
+from gga.metrics import ReconstructionMetrics, GenerationMetrics
 
 from . import models
 
@@ -32,40 +35,16 @@ from . import models
 TFDS = tf.data.Dataset
 
 
-def rsqrt_schedule(
-    init_value: float,
-    shift: int = 0,
-):
-    """Applies a reverse square-root schedule.
-
-    The reverse square root schedule is simply `lr = init_value / sqrt(step)`.
-
-    Args:
-      init_value: Base learning rate (before applying the rsqrt schedule).
-      shift: How many steps the rsqrt should be shifted. Shifting the rsqrt
-        schedule makes it less steep in the beginning (close to 0).
-
-    Returns:
-      A schedule `count -> learning_rate`.
-    """
-
-    def schedule(count):
-        return init_value * (count + shift) ** -0.5 * shift**0.5
-
-    return schedule
+def normalize(x, mean, std):
+    return (x - mean) / std
 
 
-def create_learning_rate_schedule(learning_rate: float, warmup_steps: int):
-    """Creates a rsqrt schedule with linear warmup."""
-    return optax.join_schedules(
-        [
-            optax.linear_schedule(
-                init_value=0, end_value=learning_rate, transition_steps=warmup_steps
-            ),
-            rsqrt_schedule(init_value=learning_rate, shift=warmup_steps),
-        ],
-        boundaries=[warmup_steps],
-    )
+def denormalize(x, mean, std):
+    return x * std + mean
+
+
+def to_pos(x, ds_info):
+    return smpl.recover_from_ric(denormalize(x, ds_info["mean"], ds_info["std"]))
 
 
 def kl_divergence(mean, logvar):
@@ -89,7 +68,7 @@ class Losses:
     kl_loss: jax.Array
 
 
-def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None):
+def train_step(state, batch, ds_info, config, dropout_rng=None, noise_rng=None):
     """Perform a single training step."""
     train_keys = ["motion", "mask"]
     (inputs, input_mask) = (batch.get(k, None) for k in train_keys)
@@ -106,8 +85,8 @@ def train_step(state, batch, config, mean, std, dropout_rng=None, noise_rng=None
             rngs={"dropout": dropout_rng, "noise": noise_rng},
         )
 
-        gt_pos = smpl.recover_from_ric(inputs * std + mean)
-        pos = smpl.recover_from_ric(output.recons * std + mean)
+        gt_pos = to_pos(inputs, ds_info)
+        pos = to_pos(output.recons, ds_info)
 
         pos_recons_loss = smooth_l1_loss(pos, gt_pos).mean()
         recons_loss = smooth_l1_loss(output.recons, inputs).mean()
@@ -174,15 +153,14 @@ def generate_samples(state, batch, config, noise_rng=None):
     return motion
 
 
-def generate_step(state, batch, mean, std, config, noise_rng=None):
+def generate_step(state, batch, ds_info, config, noise_rng=None):
     motion = generate_samples(state, batch, config, noise_rng)
-    motion = motion * std + mean
-    joints = smpl.recover_from_ric(motion)
+    joints = to_pos(motion, ds_info)
     joints *= batch["mask"][:, :, None, None]
     return joints
 
 
-def reconstruct(state, batch, mean, std, config, noise_rng=None):
+def reconstruct(state, batch, ds_info, config, noise_rng=None):
     inputs = batch["motion"]
     input_mask = batch["mask"]
 
@@ -192,13 +170,12 @@ def reconstruct(state, batch, mean, std, config, noise_rng=None):
         input_mask,
         rngs={"noise": noise_rng},
     )
-    motion = output.recons * std + mean
-    joints = smpl.recover_from_ric(motion)
+    joints = to_pos(output.recons, ds_info)
     joints *= batch["mask"][:, :, None, None]
     return joints
 
 
-def eval_step(state, batch, config, mean, std, noise_rng=None):
+def eval_step(state, batch, ds_info, config, noise_rng=None):
     """Calculate evaluation metrics on a batch."""
     eval_keys = ["motion", "mask"]
     (inputs, input_mask) = (batch.get(k, None) for k in eval_keys)
@@ -219,8 +196,8 @@ def eval_step(state, batch, config, mean, std, noise_rng=None):
         method="encode",
     )
 
-    gt_pos = smpl.recover_from_ric(inputs * std + mean)
-    pos = smpl.recover_from_ric(output.recons * std + mean)
+    gt_pos = to_pos(inputs, ds_info)
+    pos = to_pos(output.recons, ds_info)
 
     pos_recons_loss = smooth_l1_loss(pos, gt_pos).mean()
     recons_loss = smooth_l1_loss(output.recons, inputs).mean()
@@ -267,8 +244,6 @@ class LoopConfig:
     eval_steps: int = 100
     total_steps: int = 600_000
     learning_rate: float = 1e-4
-    weight_decay: float = 1e-7
-    warmup_steps: int = 5000
     grad_accum_steps: int = 2
 
 
@@ -303,21 +278,11 @@ def create_state(
         jnp.ones(input_mask_shape, jnp.bool_),
     )
 
-    learning_rate_fn = create_learning_rate_schedule(
-        learning_rate=loop_config.learning_rate, warmup_steps=loop_config.warmup_steps
-    )
-
     dynamic_scale = None
     if dtype == jnp.float16:
         dynamic_scale = dynamic_scale_lib.DynamicScale()
 
-    optimizer = optax.adamw(
-        learning_rate=learning_rate_fn,
-        b1=0.9,
-        b2=0.98,
-        eps=1e-9,
-        weight_decay=loop_config.weight_decay,
-    )
+    optimizer = optax.adamw(learning_rate=loop_config.learning_rate)
 
     if loop_config.grad_accum_steps > 1:
         optimizer = optax.MultiSteps(
@@ -338,13 +303,12 @@ def train_loop(
     seed: int,
     state: TrainState,
     train_ds: TFDS,
+    train_info: Dict[str, Any],
     eval_ds: TFDS,
-    mean,
-    std,
+    eval_info: Dict[str, Any],
     loop_config: LoopConfig,
     config: models.TransformerConfig,
 ):
-    # Replicate state.
     state = jax_utils.replicate(state)
 
     rng = jax.random.PRNGKey(seed)
@@ -352,16 +316,15 @@ def train_loop(
     dropout_rngs = jax.random.split(dropout_rng, jax.local_device_count())
     noise_rngs = jax.random.split(noise_rng, jax.local_device_count())
 
-    # compile multidevice versions of train/eval/predict step and cache init fn.
     p_train_step = jax.pmap(
-        functools.partial(train_step, config=config),
+        functools.partial(train_step, ds_info=train_info, config=config),
         axis_name="device",
         donate_argnums=(0,),
     )
 
     eval_config = config.replace(deterministic=True)
     p_eval_step = jax.pmap(
-        functools.partial(eval_step, config=eval_config),
+        functools.partial(eval_step, ds_info=eval_info, config=eval_config),
         axis_name="device",
         donate_argnums=(0,),
     )
@@ -389,12 +352,11 @@ def train_loop(
     for elapsed, batch in ciclo.elapse(
         train_ds.as_numpy_iterator(), stop=loop_config.total_steps
     ):
+        text = batch.pop("text")
         batch = common_utils.shard(batch)
         new_logs, state = p_train_step(
             state,
             batch,
-            mean=mean,
-            std=std,
             dropout_rng=dropout_rngs,
             noise_rng=noise_rngs,
         )
@@ -418,12 +380,11 @@ def train_loop(
             for eval_elapsed, batch in ciclo.elapse(
                 eval_ds.as_numpy_iterator(), stop=loop_config.eval_steps
             ):
+                text = batch.pop("text")
                 batch = common_utils.shard(batch)
                 eval_logs.updates, state = p_eval_step(
                     state,
                     batch,
-                    mean=mean,
-                    std=std,
                     noise_rng=noise_rngs,
                 )
                 eval_history.commit(eval_elapsed, eval_logs)

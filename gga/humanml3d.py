@@ -1,19 +1,11 @@
-import functools
-
-import dataclasses
+from typing import Callable, Optional
 
 import numpy as np
 
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-from . import vae
-
 AUTOTUNE = tf.data.AUTOTUNE
-
-
-def pad_motions(batch):
-    batch["motion"]
 
 
 def calc_mean(motion_ds) -> np.ndarray:
@@ -58,155 +50,96 @@ def normalize(x, mean, std):
     return (x - mean) / std
 
 
-@dataclasses.dataclass
-class HumanML3DConfig:
-    min_length: int = 40
-    max_length: int = 196
-
-
 def length_mask(length, max_length):
     idx = tf.range(max_length, dtype=length.dtype)
     mask = idx < length
     return mask
 
 
-def load_motion(
-    loop_config: vae.train.LoopConfig, config: HumanML3DConfig
-) -> tf.data.Dataset:
-    train_ds, eval_ds = tfds.load("humanml3d", split=["train", "val"])
+class HumanML3D:
+    def __init__(
+        self,
+        min_length: int = 40,
+        max_length: int = 196,
+        tokenizer: Optional[Callable] = None,
+    ):
+        self.min_length = min_length
+        self.max_length = max_length
+        self.tokenizer = tokenizer
 
-    def load_dataset(ds):
+    def prepare(
+        self,
+        split,
+    ) -> tf.data.Dataset:
+        ds: tf.data.Dataset = tfds.load("humanml3d", split=split, shuffle_files=True)
+
         ds = ds.filter(
             lambda batch: tf.math.reduce_any(
                 tf.logical_and(
-                    tf.math.greater_equal(batch["length"], config.min_length),
-                    tf.math.less_equal(batch["length"], config.max_length),
+                    tf.math.greater_equal(batch["length"], self.min_length),
+                    tf.math.less_equal(batch["length"], self.max_length),
                 )
             )
         )
-        return ds
 
-    train_ds, eval_ds = [load_dataset(ds) for ds in [train_ds, eval_ds]]
+        motion_ds = ds.map(lambda x: x["motion"], num_parallel_calls=AUTOTUNE)
 
-    motion_ds = train_ds.map(lambda x: x["motion"], num_parallel_calls=AUTOTUNE)
+        mean = calc_mean(motion_ds)
+        std = calc_std(motion_ds, mean)
 
-    mean = calc_mean(motion_ds)
-    std = calc_std(motion_ds, mean)
-
-    def norm_and_batch(ds, shuffle: bool):
-        ds = ds.map(
-            lambda x: {
-                "motion": normalize(x["motion"], mean=mean, std=std),
-                "mask": length_mask(x["length"], max_length=config.max_length),
-            },
-            num_parallel_calls=AUTOTUNE,
-        )
-
-        num_samples = 0
-        for batch in ds:
-            num_samples += 1
-
-        count = loop_config.total_steps // num_samples
-        if loop_config.total_steps % num_samples > 0:
-            count += 1
-
-        if shuffle:
-            ds = ds.shuffle(num_samples, reshuffle_each_iteration=True)
-
-        ds = (
-            ds.repeat(count * loop_config.batch_size)
-            .padded_batch(
-                loop_config.batch_size,
-                padded_shapes={
-                    "motion": (config.max_length, None),
-                    "mask": (config.max_length,),
-                },
-                drop_remainder=True,
-            )
-            .prefetch(AUTOTUNE)
-        )
-        return ds
-
-    train_ds = norm_and_batch(train_ds, shuffle=True)
-    eval_ds = norm_and_batch(eval_ds, shuffle=False)
-
-    ds = {
-        "train": train_ds,
-        "val": eval_ds,
-        "mean": mean,
-        "std": std,
-    }
-
-    return ds
-
-
-def load_motion_text(
-    loop_config: vae.train.LoopConfig, config: HumanML3DConfig
-) -> tf.data.Dataset:
-    train_ds, eval_ds = tfds.load("humanml3d", split=["train", "val"])
-
-    def load_dataset(ds):
-        ds = ds.filter(
-            lambda batch: tf.math.reduce_any(
-                tf.logical_and(
-                    tf.math.greater_equal(batch["length"], config.min_length),
-                    tf.math.less_equal(batch["length"], config.max_length),
-                )
-            )
-        )
-        return ds
-
-    train_ds, eval_ds = [load_dataset(ds) for ds in [train_ds, eval_ds]]
-
-    motion_ds = train_ds.map(lambda x: x["motion"], num_parallel_calls=AUTOTUNE)
-
-    mean = calc_mean(motion_ds)
-    std = calc_std(motion_ds, mean)
-
-    def norm_and_batch(ds, shuffle: bool):
-        ds = ds.map(
-            lambda x: {
+        def prepare(x):
+            batch = {
                 "motion": normalize(x["motion"], mean=mean, std=std),
                 "text": tf.expand_dims(x["caption"], axis=0),
-                "mask": length_mask(x["length"], max_length=config.max_length),
-            },
-            num_parallel_calls=AUTOTUNE,
-        )
+                "mask": length_mask(x["length"], max_length=self.max_length),
+            }
+            if self.tokenizer is not None:
+                batch["text"] = self.tokenizer(batch["text"])
 
+            return batch
+
+        ds = ds.map(prepare, num_parallel_calls=AUTOTUNE)
+
+        info = {}
+        info["mean"] = mean
+        info["std"] = std
+
+        return ds, info
+
+    def batch(
+        self,
+        ds,
+        info,
+        batch_size: int,
+        total_steps: Optional[int] = None,
+        drop_remainder=False,
+        shuffle=True,
+    ):
         num_samples = 0
         for _ in ds:
             num_samples += 1
 
-        count = loop_config.total_steps // num_samples
-        if loop_config.total_steps % num_samples > 0:
-            count += 1
+        ds = ds.shuffle(num_samples, reshuffle_each_iteration=True)
 
-        if shuffle:
-            ds = ds.shuffle(num_samples, reshuffle_each_iteration=True)
+        if total_steps is not None:
+            count = total_steps // num_samples
+            if total_steps % num_samples > 0:
+                count += 1
 
-        ds = (
-            ds.repeat(count * loop_config.batch_size)
-            .padded_batch(
-                loop_config.batch_size,
-                padded_shapes={
-                    "motion": (config.max_length, None),
-                    "text": (1,),
-                    "mask": (config.max_length,),
-                },
-                drop_remainder=True,
-            )
-            .prefetch(AUTOTUNE)
-        )
-        return ds
+            ds = ds.repeat(count * batch_size)
 
-    train_ds = norm_and_batch(train_ds, shuffle=True)
-    eval_ds = norm_and_batch(eval_ds, shuffle=False)
+            info["epochs"] = count
 
-    ds = {
-        "train": train_ds,
-        "val": eval_ds,
-        "mean": mean,
-        "std": std,
-    }
+        ds = ds.padded_batch(
+            batch_size,
+            padded_shapes={
+                "motion": (self.max_length, None),
+                "text": (None,),
+                "mask": (self.max_length,),
+            },
+            drop_remainder=drop_remainder,
+        ).prefetch(AUTOTUNE)
 
-    return ds
+        info["length"] = num_samples
+
+        return ds, info
