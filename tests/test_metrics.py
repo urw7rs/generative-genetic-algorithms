@@ -642,3 +642,21 @@ def test_pampjpe():
 
     chex.assert_equal_shape([pampjpe.numpy(), jax_pampjpe])
     chex.assert_trees_all_close(pampjpe.numpy(), jax_pampjpe, rtol=0.5, atol=1e-5)
+
+
+def test_fid():
+    mu = torch.randn(7, 256).numpy()
+    target_mu = 0.5 * mu + 5
+
+    mu, cov = calculate_activation_statistics_np(mu)
+    target_mu, target_cov = calculate_activation_statistics_np(target_mu)
+
+    fid = calculate_frechet_distance_np(target_mu, target_cov, mu, cov)
+
+    jax_fid = gga.metrics.compute_fid(mu, target_mu)
+
+    chex.assert_trees_all_close(fid, jax_fid, rtol=1000, atol=1e-6)
+
+
+def test_diversity():
+    ...

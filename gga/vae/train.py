@@ -2,6 +2,7 @@ from typing import Any, Dict, Mapping
 
 import functools
 from pathlib import Path
+from dataclasses import asdict
 
 from rich.progress import track
 
@@ -15,7 +16,6 @@ import jax
 import jax.numpy as jnp
 
 import optax
-from orbax.checkpoint import checkpoint_utils
 from orbax.checkpoint import (
     CheckpointManagerOptions,
     CheckpointManager,
@@ -26,7 +26,6 @@ from orbax.checkpoint import (
 
 from flax import jax_utils
 from flax import struct
-from flax.training import orbax_utils
 from flax.training import common_utils
 from flax.training import train_state
 from flax.training import dynamic_scale as dynamic_scale_lib
@@ -35,6 +34,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from gga import smpl
 from gga.metrics import ReconstructionMetrics, GenerationMetrics
+from gga.metrics import compute_fid, compute_diversity
 
 from . import models
 
@@ -70,6 +70,7 @@ def smooth_l1_loss(preds, target, beta: float = 1.0):
 
 @struct.dataclass
 class Losses:
+    total_loss: jax.Array
     recons_loss: jax.Array
     pos_recons_loss: jax.Array
     kl_loss: jax.Array
@@ -101,7 +102,7 @@ def train_step(state, batch, ds_info, config, dropout_rng=None, noise_rng=None):
 
         loss = recons_loss + pos_recons_loss + kl_loss
 
-        return loss, Losses(recons_loss, pos_recons_loss, kl_loss)
+        return loss, Losses(loss, recons_loss, pos_recons_loss, kl_loss)
 
     if state.dynamic_scale:
         # dynamic scale takes care of averaging gradients across replicas
@@ -122,10 +123,7 @@ def train_step(state, batch, ds_info, config, dropout_rng=None, noise_rng=None):
 
     new_state = state.apply_gradients(grads=grads)
 
-    loss = jax.lax.pmean(loss, axis_name="device")
-    recons_loss = jax.lax.pmean(losses.recons_loss, axis_name="device")
-    pos_recons_loss = jax.lax.pmean(losses.pos_recons_loss, axis_name="device")
-    kl_loss = jax.lax.pmean(losses.kl_loss, axis_name="device")
+    losses = jax.lax.pmean(losses, axis_name="device")
 
     if state.dynamic_scale:
         # if is_fin == False the gradients contain Inf/NaNs and optimizer state and
@@ -139,10 +137,7 @@ def train_step(state, batch, ds_info, config, dropout_rng=None, noise_rng=None):
         )
 
     logs = {}
-    logs["train/recons_loss"] = recons_loss
-    logs["train/pos_recons_loss"] = pos_recons_loss
-    logs["train/kl_loss"] = kl_loss
-    logs["train/loss"] = loss
+    logs["losses"] = losses
     return logs, new_state
 
 
@@ -212,23 +207,33 @@ def eval_step(state, batch, ds_info, config, noise_rng=None):
 
     loss = recons_loss + pos_recons_loss + kl_loss
 
-    losses = Losses(recons_loss, pos_recons_loss, kl_loss)
-
-    loss = jax.lax.pmean(loss, axis_name="device")
-    recons_loss = jax.lax.pmean(losses.recons_loss, axis_name="device")
-    pos_recons_loss = jax.lax.pmean(losses.pos_recons_loss, axis_name="device")
-    kl_loss = jax.lax.pmean(losses.kl_loss, axis_name="device")
+    losses = Losses(loss, recons_loss, pos_recons_loss, kl_loss)
+    losses = jax.lax.pmean(losses, axis_name="device")
 
     logs = {}
-    logs["recons_loss"] = recons_loss
-    logs["pos_recons_loss"] = pos_recons_loss
-    logs["kl_loss"] = kl_loss
-    logs["loss"] = loss
+    logs["losses"] = losses
+
+    metrics = {}
+    metrics["reconstruction"] = ReconstructionMetrics.create(gt_pos, pos, input_mask)
+    logs["metrics"] = metrics
+
     return logs, state
 
 
-def reset_step(state):
-    return state.replace(metrics=state.metrics.reset())
+def compute_metrics(history, recons_metric):
+    losses = collect(history, "losses")
+    losses = list(map(asdict, losses))
+
+    metrics = []
+    for key in losses[0].keys():
+        avg_loss = onp.stack(collect(losses, key)).mean(axis=0)
+
+        writer.add_scalar(f"val/{key}", onp.asarray(avg_loss), step)
+
+    metrics = recons_metric.compute()
+    breakpoint()
+    metrics = jax.tree_map(lambda x: x.item(), metrics)
+    return metrics
 
 
 def preferred_dtype(use_mixed_precision):
@@ -318,7 +323,7 @@ def train_loop(
     config: models.TransformerConfig,
 ):
     def best_fn(metrics: Mapping[str, float]) -> float:
-        return metrics["recons_loss"]
+        return metrics["mpjpe"]
 
     options = CheckpointManagerOptions(max_to_keep=5, best_fn=best_fn, best_mode="min")
 
@@ -372,36 +377,48 @@ def train_loop(
 
         if step % 50 == 0:
             # state is replicated for each device
-            for key, value in logs.items():
-                if "val" not in key:
-                    writer.add_scalar(key, onp.asarray(value[0]), step)
+            logs = jax_utils.unreplicate(logs)
+            losses = asdict(logs["losses"])
+            for key, value in losses.items():
+                writer.add_scalar(f"train/{key}", onp.asarray(value), step)
 
         if step % 10_000 == 0:
-            eval_logs = {}
+            recons_metric = None
+
+            history = []
             for batch in eval_ds.as_numpy_iterator():
                 batch.pop("text")
                 batch = common_utils.shard(batch)
 
-                eval_log, state = p_eval_step(
+                log, state = p_eval_step(
                     state,
                     batch,
                     noise_rng=noise_rngs,
                 )
 
-                for key in eval_log.keys():
-                    if key not in eval_logs.keys():
-                        eval_logs[key] = []
+                recons_metric = ReconstructionMetrics.update(
+                    recons_metric, log["metrics"]["reconstruction"]
+                )
 
-                    eval_logs[key].append(eval_log[key])
+                log = jax_utils.unreplicate(log)
+                history.append(log)
 
-            metrics = {}
-            for key in eval_logs.keys():
-                metric = onp.stack(eval_logs[key]).mean(axis=0)
-                metrics[key] = metric[0].item()
-                writer.add_scalar(f"val/{key}", onp.asarray(metric[0]), step)
+            losses = collect(history, "losses")
+            losses = list(map(asdict, losses))
 
-            single_state = jax.tree_map(lambda x: x[0], state)
-            checkpoint_manager.save(step, single_state, metrics=metrics)
+            for key in losses[0].keys():
+                avg_loss = onp.stack(collect(losses, key)).mean(axis=0)
+
+                writer.add_scalar(f"val/{key}", onp.asarray(avg_loss), step)
+
+            breakpoint()
+            metrics = recons_metric.compute()
+            metrics = jax.tree_map(lambda x: x.item(), metrics)
+
+            for key, value in metrics.items():
+                writer.add_scalar(f"val/{key}", value, step)
+
+            checkpoint_manager.save(step, jax_utils.unreplicate(state), metrics=metrics)
 
         step += 1
 
@@ -411,3 +428,10 @@ def train_loop(
     writer.close()
 
     return state
+
+
+def collect(list_of_dicts, key):
+    output = []
+    for entry in list_of_dicts:
+        output.append(entry[key])
+    return output

@@ -1,3 +1,4 @@
+from typing import Any, Optional
 from jax.typing import ArrayLike
 
 import jax
@@ -137,7 +138,8 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     diff = mu1 - mu2
 
     # Product might be almost singular
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    covmean = linalg.sqrtm(sigma1.dot(sigma2))
+
     if not jnp.isfinite(covmean).all():
         msg = (
             "fid calculation produces singular product; "
@@ -148,11 +150,10 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
         covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
 
     # Numerical error might give slight imaginary component
-    if jnp.iscomplexobj(covmean):
-        if not jnp.allclose(jnp.diagonal(covmean).imag, 0, atol=1e-3):
-            m = jnp.max(jnp.abs(covmean.imag))
-            raise ValueError("Imaginary component {}".format(m))
-        covmean = covmean.real
+    if not jnp.allclose(jnp.diagonal(covmean).imag, 0, atol=1e-3):
+        m = jnp.max(jnp.abs(covmean.imag))
+        raise ValueError("Imaginary component {}".format(m))
+    covmean = covmean.real
 
     tr_covmean = jnp.trace(covmean)
 
@@ -218,7 +219,6 @@ def batched_accel(preds, target):
     often referred to as "Protocol #1" in many papers.
     """
     assert preds.shape == target.shape  # BxJx3
-    assert preds.dim() == 3
     # Expects BxJx3
     # valid_mask = torch.BoolTensor(target[:, :, 0].shape)
     accel_gt = target[:-2] - 2 * target[1:-1] + target[2:]
@@ -312,41 +312,206 @@ def batched_pampjpe(preds, target):
 
 
 @struct.dataclass
-class ReconstructionMetrics:
+class MPJPE:
     mpjpe: jax.Array
+    count: jax.Array
+
+    @classmethod
+    def create(
+        cls,
+        targets: ArrayLike,
+        predictions: ArrayLike,
+        mask: Optional[ArrayLike] = None,
+        count: Optional[ArrayLike] = None,
+    ):
+        mpjpe = batched_mpjpe(predictions, targets).sum()
+        if count is None:
+            count = mask.sum()
+        return cls(mpjpe, count)
+
+    @staticmethod
+    def update(state, metric):
+        if state is None:
+            return metric
+        else:
+            return MPJPE(
+                state.mpjpe + metric.mpjpe,
+                state.count + metric.count,
+            )
+
+    def compute(self, in_meters: bool = True):
+        factor = 1000 if in_meters else 1
+        return self.mpjpe / self.count * factor
+
+
+@struct.dataclass
+class PAMPJPE:
     pampjpe: jax.Array
+    count: jax.Array
+
+    @classmethod
+    def create(
+        cls,
+        targets: ArrayLike,
+        predictions: ArrayLike,
+        mask: Optional[ArrayLike] = None,
+        count: Optional[ArrayLike] = None,
+    ):
+        pampjpe = batched_pampjpe(predictions, targets).sum()
+        if count is None:
+            count = mask.sum()
+        return cls(pampjpe, count)
+
+    @staticmethod
+    def update(state, metric):
+        if state is None:
+            return metric
+        else:
+            return PAMPJPE(
+                state.pampjpe + metric.pampjpe,
+                state.count + metric.count,
+            )
+
+    def compute(self, in_meters: bool = True):
+        factor = 1000 if in_meters else 1
+        return self.pampjpe / self.count * factor
+
+
+@struct.dataclass
+class ACCEL:
     accel: jax.Array
-    count: int
-    seq_count: int
-    align_root: bool
+    count: jax.Array
+    batches: jax.Array
 
-    def update(self, targets, predictions):
-        self.mpjpe += batched_mpjpe(predictions, targets).sum()
-        self.pampjpe += batched_pampjpe(predictions, targets).sum()
-        self.accel += batched_accel(predictions, targets).sum()
+    @classmethod
+    def create(
+        cls,
+        targets: ArrayLike,
+        predictions: ArrayLike,
+        mask: Optional[ArrayLike] = None,
+        count: Optional[ArrayLike] = None,
+        batches: Optional[ArrayLike] = None,
+    ):
+        accel = batched_accel(predictions, targets).sum()
+        if count is None:
+            count = mask.sum()
+        if batches is None:
+            batches = (mask.sum(-1) != 0).sum()
 
-    def compute(self):
-        return self.mpjpe
+        return cls(accel, count, batches)
+
+    @staticmethod
+    def update(state, metric):
+        if state is None:
+            return metric
+        else:
+            return ACCEL(
+                state.accel + metric.accel,
+                state.count + metric.count,
+                state.batches + metric.batches,
+            )
+
+    def compute(self, in_meters: bool = True):
+        factor = 1000 if in_meters else 1
+        return self.accel / (self.count - 2 * self.batches) * factor
+
+
+@struct.dataclass
+class ReconstructionMetrics:
+    mpjpe: MPJPE
+    pampjpe: PAMPJPE
+    accel: ACCEL
+
+    @classmethod
+    def create(cls, targets: ArrayLike, predictions: ArrayLike, mask: ArrayLike):
+        count = mask.sum()
+        batches = (mask.sum(-1) != 0).sum()
+
+        mpjpe = MPJPE.create(predictions, targets, mask, count)
+        pampjpe = PAMPJPE.create(predictions, targets, mask, count)
+        accel = ACCEL.create(predictions, targets, mask, count, batches)
+
+        return cls(mpjpe, pampjpe, accel)
+
+    @staticmethod
+    def update(state, metric):
+        if state is None:
+            return metric
+        else:
+            return ReconstructionMetrics(
+                MPJPE.update(state.mpjpe, metric.mpjpe),
+                PAMPJPE.update(state.pampjpe, metric.pampjpe),
+                ACCEL.update(state.accel, metric.accel),
+            )
+
+    def compute(self, in_meters: bool = True):
+        return {
+            "mpjpe": self.mpjpe.compute(in_meters),
+            "pampje": self.pampjpe.compute(in_meters),
+            "accel": self.accel.compute(),
+        }
+
+
+@struct.dataclass
+class FID:
+    @classmethod
+    def create(cls, targets, predictions):
+        targets = jnp.reshape(targets, (-1, targets.shape[-1]))
+        predictions = jnp.reshape(predictions, (-1, predictions.shape[-1]))
+
+        return cls(predictions, targets)
+
+    @classmethod
+    def update(cls, state, metric):
+        if state is None:
+            return metric
+
+        predictions = jnp.concatenate([state.predictions, metric.predictions], axis=0)
+        targets = jnp.concatenate([state.targets, metric.targets], axis=0)
+
+        return cls(predictions, targets)
+
+    @staticmethod
+    def compute(self, predictions, targets):
+        mu, cov = calculate_activation_statistics(predictions)
+        gt_mu, gt_cov = calculate_activation_statistics(targets)
+
+        fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
+        return fid
+
+
+@struct.dataclass
+class Diversity:
+    @classmethod
+    def update(cls, state, metric):
+        if state is None:
+            return metric
 
 
 @struct.dataclass
 class GenerationMetrics:
-    targets: jax.Array
-    predictions: jax.Array
+    fid: FID
+    diversity: Diversity
 
-    def update(self, targets, predictions):
-        ...
+    @classmethod
+    def create(cls, targets, predictions):
+        return cls(FID.create(targets, predictions), Diversity.create())
+
+    @staticmethod
+    def update(state, metric):
+        targets = jnp.concatenate([state.targets, metric.targets], axis=0)
+        preds = jnp.concatenate([state.predictions, metric.predictions], axis=0)
+        return GenerationMetrics(targets, preds)
+
+    def compute(self):
+        fid = 0
+        diversity = 0
+        return {"fid": fid, "diversity": diversity}
 
 
-def update(state, targets, predictions):
-    targets = jnp.concatenate([state.targets, targets], axis=0)
-    preds = jnp.concatenate([state.predictions, predictions], axis=0)
-    return GenerationMetrics(targets, preds)
-
-
-def compute_fid(state):
-    mu, cov = calculate_activation_statistics(state.preds)
-    gt_mu, gt_cov = calculate_activation_statistics(state.targets)
+def compute_fid(predictions, targets):
+    mu, cov = calculate_activation_statistics(predictions)
+    gt_mu, gt_cov = calculate_activation_statistics(targets)
 
     fid_score = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
     return fid_score
