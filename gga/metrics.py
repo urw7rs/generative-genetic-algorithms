@@ -1,5 +1,9 @@
-from typing import Any, Optional
+from functools import partial
+from typing import Optional
 from jax.typing import ArrayLike
+
+import numpy as np
+import scipy
 
 import jax
 import jax.numpy as jnp
@@ -37,7 +41,7 @@ def calculate_top_k(mat, top_k):
         correct_vec = correct_vec | bool_mat[:, i]
         # print(correct_vec)
         top_k_list.append(correct_vec[:, None])
-    top_k_mat = jnp.concatenate(top_k_list, axis=1)
+    top_k_mat = jnp.concatenate(top_k_list, axis=0)
     return top_k_mat
 
 
@@ -56,7 +60,7 @@ def calculate_matching_score(embedding1, embedding2, sum_all=False):
     assert embedding1.shape[0] == embedding2.shape[0]
     assert embedding1.shape[1] == embedding2.shape[1]
 
-    dist = linalg.norm(embedding1 - embedding2, axis=1)
+    dist = jnp.linalg.norm(embedding1 - embedding2, axis=1)
     if sum_all:
         return dist.sum(axis=0)
     else:
@@ -76,14 +80,21 @@ def calculate_activation_statistics(activations):
     return mu, cov
 
 
-def calculate_diversity(activation, diversity_times):
+def calculate_diversity(key, activation, diversity_times):
     assert len(activation.shape) == 2
     assert activation.shape[0] > diversity_times
     num_samples = activation.shape[0]
 
-    first_indices = jax.random.choice(num_samples, diversity_times, replace=False)
-    second_indices = jax.random.choice(num_samples, diversity_times, replace=False)
-    dist = linalg.norm(activation[first_indices] - activation[second_indices], axis=1)
+    first_key, second_key = jax.random.split(key)
+    first_indices = jax.random.choice(
+        first_key, num_samples, (diversity_times,), replace=False
+    )
+    second_indices = jax.random.choice(
+        second_key, num_samples, (diversity_times,), replace=False
+    )
+    dist = jnp.linalg.norm(
+        activation[first_indices] - activation[second_indices], axis=1
+    )
     return dist.mean()
 
 
@@ -93,13 +104,15 @@ def calculate_multimodality(activation, multimodality_times, key):
     num_per_sent = activation.shape[1]
 
     key, first_key, second_key = jax.random.split(key, 3)
-    first_dices = jax.random.choice(
-        first_key, num_per_sent, multimodality_times, replace=False
+    first_indices = jax.random.choice(
+        first_key, num_per_sent, (multimodality_times,), replace=False
     )
-    second_dices = jax.random.choice(
-        second_key, num_per_sent, multimodality_times, replace=False
+    second_indices = jax.random.choice(
+        second_key, num_per_sent, (multimodality_times,), replace=False
     )
-    dist = linalg.norm(activation[:, first_dices] - activation[:, second_dices], axis=2)
+    dist = jnp.linalg.norm(
+        activation[:, first_indices] - activation[:, second_indices], axis=2
+    )
     return dist.mean()
 
 
@@ -114,19 +127,19 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
                inception net (like returned by the function 'get_predictions')
                for generated samples.
     -- mu2   : The sample mean over activations, precalculated on an
-               representative dataset set.
+               representative data set.
     -- sigma1: The covariance matrix over activations for generated samples.
     -- sigma2: The covariance matrix over activations, precalculated on an
-               representative dataset set.
+               representative data set.
     Returns:
     --   : The Frechet Distance.
     """
 
-    mu1 = jnp.atleast_1d(mu1)
-    mu2 = jnp.atleast_1d(mu2)
+    mu1 = np.atleast_1d(mu1)
+    mu2 = np.atleast_1d(mu2)
 
-    sigma1 = jnp.atleast_2d(sigma1)
-    sigma2 = jnp.atleast_2d(sigma2)
+    sigma1 = np.atleast_2d(sigma1)
+    sigma2 = np.atleast_2d(sigma2)
 
     assert (
         mu1.shape == mu2.shape
@@ -136,28 +149,27 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     ), "Training and test covariances have different dimensions"
 
     diff = mu1 - mu2
-
     # Product might be almost singular
-    covmean = linalg.sqrtm(sigma1.dot(sigma2))
-
-    if not jnp.isfinite(covmean).all():
+    covmean, _ = scipy.linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
         msg = (
             "fid calculation produces singular product; "
             "adding %s to diagonal of cov estimates"
         ) % eps
         print(msg)
-        offset = jnp.eye(sigma1.shape[0]) * eps
-        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+        offset = np.eye(sigma1.shape[0]) * eps
+        covmean = scipy.linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
 
     # Numerical error might give slight imaginary component
-    if not jnp.allclose(jnp.diagonal(covmean).imag, 0, atol=1e-3):
-        m = jnp.max(jnp.abs(covmean.imag))
-        raise ValueError("Imaginary component {}".format(m))
-    covmean = covmean.real
+    if np.iscomplexobj(covmean):
+        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+            m = np.max(np.abs(covmean.imag))
+            raise ValueError("Imaginary component {}".format(m))
+            # print("Imaginary component {}".format(m))
+        covmean = covmean.real
+    tr_covmean = np.trace(covmean)
 
-    tr_covmean = jnp.trace(covmean)
-
-    return diff.dot(diff) + jnp.trace(sigma1) + jnp.trace(sigma2) - 2 * tr_covmean
+    return diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
 
 
 def compute_mpjpe(preds, target, valid_mask=None, pck_joints=None, sample_wise=True):
@@ -192,7 +204,7 @@ def align_by_parts(joints, align_indices=None):
 
 def calc_mpjpe(preds, target, align_indices=[0], sample_wise=True, trans=None):
     # Expects BxJx3
-    valid_mask = target[:, :, 0] != -2.0
+    valid_mask = target[..., 0] != -2.0
     # valid_mask = torch.BoolTensor(target[:, :, 0].shape)
     if align_indices is not None:
         preds_aligned = align_by_parts(preds, align_indices=align_indices)
@@ -339,9 +351,8 @@ class MPJPE:
                 state.count + metric.count,
             )
 
-    def compute(self, in_meters: bool = True):
-        factor = 1000 if in_meters else 1
-        return self.mpjpe / self.count * factor
+    def compute(self):
+        return self.mpjpe / self.count * 1000
 
 
 @struct.dataclass
@@ -372,9 +383,8 @@ class PAMPJPE:
                 state.count + metric.count,
             )
 
-    def compute(self, in_meters: bool = True):
-        factor = 1000 if in_meters else 1
-        return self.pampjpe / self.count * factor
+    def compute(self):
+        return self.pampjpe / self.count * 1000
 
 
 @struct.dataclass
@@ -411,9 +421,8 @@ class ACCEL:
                 state.batches + metric.batches,
             )
 
-    def compute(self, in_meters: bool = True):
-        factor = 1000 if in_meters else 1
-        return self.accel / (self.count - 2 * self.batches) * factor
+    def compute(self):
+        return self.accel / (self.count - 2 * self.batches) * 1000
 
 
 @struct.dataclass
@@ -423,7 +432,7 @@ class ReconstructionMetrics:
     accel: ACCEL
 
     @classmethod
-    def create(cls, targets: ArrayLike, predictions: ArrayLike, mask: ArrayLike):
+    def create(cls, predictions: ArrayLike, targets: ArrayLike, mask: ArrayLike):
         count = mask.sum()
         batches = (mask.sum(-1) != 0).sum()
 
@@ -444,10 +453,10 @@ class ReconstructionMetrics:
                 ACCEL.update(state.accel, metric.accel),
             )
 
-    def compute(self, in_meters: bool = True):
+    def compute(self):
         return {
-            "mpjpe": self.mpjpe.compute(in_meters),
-            "pampje": self.pampjpe.compute(in_meters),
+            "mpjpe": self.mpjpe.compute(),
+            "pampje": self.pampjpe.compute(),
             "accel": self.accel.compute(),
         }
 
@@ -490,12 +499,14 @@ class Diversity:
 
 @struct.dataclass
 class GenerationMetrics:
-    fid: FID
-    diversity: Diversity
+    predictions: jax.Array
+    targets: jax.Array
 
     @classmethod
-    def create(cls, targets, predictions):
-        return cls(FID.create(targets, predictions), Diversity.create())
+    def create(cls, predictions, targets):
+        targets = targets.reshape(-1, targets.shape[-1])
+        predictions = predictions.reshape(-1, predictions.shape[-1])
+        return cls(predictions, targets)
 
     @staticmethod
     def update(state, metric):
@@ -503,9 +514,11 @@ class GenerationMetrics:
         preds = jnp.concatenate([state.predictions, metric.predictions], axis=0)
         return GenerationMetrics(targets, preds)
 
-    def compute(self):
-        fid = 0
-        diversity = 0
+    def compute(self, key):
+        targets = self.targets.reshape(-1, self.targets.shape[-1])
+        predictions = self.predictions.reshape(-1, self.predictions.shape[-1])
+        fid = compute_fid(predictions, targets)
+        diversity = compute_diversity(key, predictions)
         return {"fid": fid, "diversity": diversity}
 
 
@@ -517,7 +530,6 @@ def compute_fid(predictions, targets):
     return fid_score
 
 
-def compute_diversity(state, n=300):
-    diversity = calculate_diversity(state.preds, n)
-    gt_diversity = calculate_diversity(state.targets, n)
-    return diversity, gt_diversity
+def compute_diversity(key, predictions, n=30):
+    diversity = calculate_diversity(key, predictions, n)
+    return diversity

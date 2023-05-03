@@ -342,6 +342,7 @@ class Encoder(nn.Module):
         for lyr in range(config.num_layers):
             if lyr > config.num_layers // 2:
                 x = jnp.concatenate([x, outputs.pop()], axis=-1)
+                x = nn.Dense(config.emb_dim)(x)
 
             x = Encoder1DBlock(config=config, name=f"encoderblock_{lyr}")(
                 x, encoder_mask
