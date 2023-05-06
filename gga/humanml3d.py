@@ -62,7 +62,6 @@ class HumanML3D:
         min_length: int = 40,
         max_length: int = 199,
         tokenizer: Optional[Callable] = None,
-        shuffle: bool = True,
     ):
         self.min_length = min_length
         self.max_length = max_length
