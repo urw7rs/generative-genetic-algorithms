@@ -1,15 +1,14 @@
-checkpoint: "tmp/orbax/managed"
+checkpoint: "mld_7"
 seed: 0
 use_mixed_precision: true
 dataset:
   class_path: gga.humanml3d.HumanML3D
   init_args:
     min_length: 40
-    max_length: 196
+    max_length: 199
     tokenizer: null
 loop_config:
   batch_size: 128
-  eval_steps: 100
   epochs: 6000
   learning_rate: 0.0001
   grad_accum_steps: 0

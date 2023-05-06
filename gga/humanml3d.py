@@ -60,8 +60,9 @@ class HumanML3D:
     def __init__(
         self,
         min_length: int = 40,
-        max_length: int = 196,
+        max_length: int = 199,
         tokenizer: Optional[Callable] = None,
+        shuffle: bool = True,
     ):
         self.min_length = min_length
         self.max_length = max_length
@@ -71,13 +72,17 @@ class HumanML3D:
         ds: tf.data.Dataset = tfds.load("humanml3d", split=split, shuffle_files=True)
 
         ds = ds.filter(
-            lambda batch: tf.math.reduce_any(
+            lambda x: tf.math.reduce_any(
                 tf.logical_and(
-                    tf.math.greater_equal(batch["length"], self.min_length),
-                    tf.math.less_equal(batch["length"], self.max_length),
+                    tf.math.greater_equal(x["length"], self.min_length),
+                    tf.math.less_equal(x["length"], self.max_length),
                 )
             )
         )
+
+        num_samples = 0
+        for _ in ds:
+            num_samples += 1
 
         motion_ds = ds.map(lambda x: x["motion"], num_parallel_calls=AUTOTUNE)
 
@@ -103,6 +108,7 @@ class HumanML3D:
 
         if shuffle:
             ds = ds.shuffle(num_samples, reshuffle_each_iteration=True)
+
         info = {}
         info["mean"] = mean
         info["std"] = std
@@ -115,7 +121,6 @@ class HumanML3D:
         ds,
         batch_size: int,
         drop_remainder=False,
-        shuffle=True,
     ):
         ds = ds.padded_batch(
             batch_size,
