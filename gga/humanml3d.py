@@ -56,6 +56,24 @@ def length_mask(length, max_length):
     return mask
 
 
+def random_shift(motion, block_size=10):
+    length = motion.shape[0]
+
+    if block_size < 10:
+        coin2 = np.random.choice(["single", "single", "double"])
+    else:
+        coin2 = "single"
+
+    if coin2 == "double":
+        length = (length // block_size - 1) * block_size
+    elif coin2 == "single":
+        length = (length // block_size) * block_size
+
+    idx = np.random.randint(0, motion.shape[0] - length + 1)
+    motion = motion[idx : idx + length]
+    return motion
+
+
 class HumanML3D:
     def __init__(
         self,
@@ -67,8 +85,14 @@ class HumanML3D:
         self.max_length = max_length
         self.tokenizer = tokenizer
 
-    def prepare(self, split, shuffle: bool = True) -> tf.data.Dataset:
-        ds: tf.data.Dataset = tfds.load("humanml3d", split=split, shuffle_files=True)
+    def prepare(
+        self,
+        split,
+        shuffle_files=False,
+    ) -> tf.data.Dataset:
+        ds: tf.data.Dataset = tfds.load(
+            "humanml3d", split=split, shuffle_files=shuffle_files
+        )
 
         ds = ds.filter(
             lambda x: tf.math.reduce_any(
@@ -105,15 +129,22 @@ class HumanML3D:
         for _ in ds:
             num_samples += 1
 
-        if shuffle:
-            ds = ds.shuffle(num_samples, reshuffle_each_iteration=True)
-
         info = {}
         info["mean"] = mean
         info["std"] = std
         info["num_samples"] = num_samples
 
         return ds, info
+
+    def augment(self, ds):
+        def augment(batch):
+            batch["motion"] = tf.py_function(
+                func=random_shift, inp=[batch["motion"]], Tout=tf.float32
+            )
+            return batch
+
+        ds = ds.map(augment, num_parallel_calls=AUTOTUNE)
+        return ds
 
     def batch(
         self,

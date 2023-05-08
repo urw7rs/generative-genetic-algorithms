@@ -1,14 +1,252 @@
-from typing import Callable, Any, Optional
-from jax.typing import ArrayLike
+from typing import Any, Callable, Optional, Tuple
+from flax.linen.dtypes import promote_dtype
+
+import functools
+
+import numpy as np
 
 from jax import lax
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from flax import linen as nn
 from flax import struct
 from flax.linen.initializers import Initializer
+
+from flax.linen import initializers
+from flax.linen.linear import default_kernel_init
+from flax.linen.linear import DenseGeneral
+from flax.linen.linear import DotGeneralT
+from flax.linen.linear import PrecisionLike
+from flax.linen.module import compact
+
+
+PRNGKey = Any
+Shape = Tuple[int, ...]
+Dtype = Any
+Array = Any
+
+
+def linear_attention(
+    query: Array,
+    key: Array,
+    value: Array,
+    mask: Optional[Array] = None,
+    dtype: Optional[Dtype] = None,
+    precision: PrecisionLike = None,
+):
+    """Computes dot-product attention given query, key, and value.
+
+    This is the core function for applying attention based on
+    https://arxiv.org/abs/1706.03762. It calculates the attention weights given
+    query and key and combines the values using the attention weights.
+
+    Note: query, key, value needn't have any batch dimensions.
+
+    Args:
+      query: queries for calculating attention with shape of
+        `[batch..., q_length, num_heads, qk_depth_per_head]`.
+      key: keys for calculating attention with shape of
+        `[batch..., kv_length, num_heads, qk_depth_per_head]`.
+      value: values to be used in attention with shape of
+        `[batch..., kv_length, num_heads, v_depth_per_head]`.
+      bias: bias for the attention weights. This should be broadcastable to the
+        shape `[batch..., num_heads, q_length, kv_length]`.
+        This can be used for incorporating causal masks, padding masks,
+        proximity bias, etc.
+      mask: mask for the attention weights. This should be broadcastable to the
+        shape `[batch..., num_heads, q_length, kv_length]`.
+        This can be used for incorporating causal masks.
+        Attention weights are masked out if their corresponding mask value
+        is `False`.
+      broadcast_dropout: bool: use a broadcasted dropout along batch dims.
+      dropout_rng: JAX PRNGKey: to be used for dropout
+      dropout_rate: dropout rate
+      deterministic: bool, deterministic or not (to apply dropout)
+      dtype: the dtype of the computation (default: infer from inputs)
+      precision: numerical precision of the computation see `jax.lax.Precision`
+        for details.
+
+    Returns:
+      Output of shape `[batch..., q_length, num_heads, v_depth_per_head]`.
+    """
+    query, key, value = promote_dtype(query, key, value, dtype=dtype)
+    dtype = query.dtype
+    assert key.ndim == query.ndim == value.ndim, "q, k, v must have same rank."
+    assert (
+        query.shape[:-3] == key.shape[:-3] == value.shape[:-3]
+    ), "q, k, v batch dims must match."
+    assert (
+        query.shape[-2] == key.shape[-2] == value.shape[-2]
+    ), "q, k, v num_heads must match."
+    assert key.shape[-3] == value.shape[-3], "k, v lengths must match."
+
+    # apply attention mask
+    if mask is not None:
+        mask = mask[..., None, None]
+        big_neg = jnp.finfo(dtype).min
+        key = jnp.where(mask, key, big_neg)
+        value = jnp.where(mask, value, 0)
+
+    dim = query.shape[-1]
+
+    query = jax.nn.softmax(query, axis=-1).astype(dtype)
+    key = jax.nn.softmax(key, axis=-3).astype(dtype)
+
+    query = query * dim**-0.5
+    context = jnp.einsum("...nhd,...nhe->...hde", key, value, precision=precision)
+    return jnp.einsum("...hde,...nhd->...nhe", context, query)
+
+
+class LinearMultiHeadAttention(nn.Module):
+    """Multi-head linear attention.
+
+    Attributes:
+      num_heads: number of attention heads. Features (i.e. inputs_q.shape[-1])
+        should be divisible by the number of heads.
+      dtype: the dtype of the computation
+        (default: infer from inputs and params)
+      param_dtype: the dtype passed to parameter initializers (default: float32)
+      qkv_features: dimension of the key, query, and value.
+      out_features: dimension of the last projection
+      broadcast_dropout: bool: use a broadcasted dropout along batch dims.
+      dropout_rate: dropout rate
+      deterministic: if false, the attention weight is masked randomly
+        using dropout, whereas if true, the attention weights
+        are deterministic.
+      precision: numerical precision of the computation see `jax.lax.Precision`
+        for details.
+      kernel_init: initializer for the kernel of the Dense layers.
+      bias_init: initializer for the bias of the Dense layers.
+      use_bias: bool: whether pointwise QKVO dense transforms use bias.
+      attention_fn: dot_product_attention or compatible function. Accepts
+        query, key, value, and returns output of shape
+        `[bs, dim1, dim2, ..., dimN,, num_heads, value_channels]``
+      decode: whether to prepare and use an autoregressive cache.
+    """
+
+    num_heads: int
+    dtype: Optional[Dtype] = None
+    param_dtype: Dtype = jnp.float32
+    qkv_features: Optional[int] = None
+    out_features: Optional[int] = None
+    precision: PrecisionLike = None
+    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
+    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
+    use_bias: bool = True
+    decode: bool = False
+    qkv_dot_general: DotGeneralT = lax.dot_general
+    out_dot_general: DotGeneralT = lax.dot_general
+
+    @compact
+    def __call__(
+        self,
+        inputs_q: Array,
+        inputs_kv: Array,
+        mask: Optional[Array] = None,
+    ):
+        """Applies multi-head dot product attention on the input data.
+
+        Projects the inputs into multi-headed query, key, and value vectors,
+        applies dot-product attention and project the results to an output vector.
+
+        Args:
+          inputs_q: input queries of shape
+            `[batch_sizes..., length, features]`.
+          inputs_kv: key/values of shape
+            `[batch_sizes..., length, features]`.
+          mask: attention mask of shape
+            `[batch_sizes..., num_heads, query_length, key/value_length]`.
+            Attention weights are masked out if their corresponding mask value
+            is `False`.
+          deterministic: if false, the attention weight is masked randomly
+            using dropout, whereas if true, the attention weights
+            are deterministic.
+
+        Returns:
+          output of shape `[batch_sizes..., length, features]`.
+        """
+        features = self.out_features or inputs_q.shape[-1]
+        qkv_features = self.qkv_features or inputs_q.shape[-1]
+        assert (
+            qkv_features % self.num_heads == 0
+        ), "Memory dimension must be divisible by number of heads."
+        head_dim = qkv_features // self.num_heads
+
+        dense = functools.partial(
+            DenseGeneral,
+            axis=-1,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            features=(self.num_heads, head_dim),
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
+            use_bias=self.use_bias,
+            precision=self.precision,
+            dot_general=self.qkv_dot_general,
+        )
+        # project inputs_q to multi-headed q/k/v
+        # dimensions are then [batch..., length, n_heads, n_features_per_head]
+        query, key, value = (
+            dense(name="query")(inputs_q),
+            dense(name="key")(inputs_kv),
+            dense(name="value")(inputs_kv),
+        )
+
+        # apply attention
+        x = linear_attention(
+            query,
+            key,
+            value,
+            mask=mask,
+            dtype=self.dtype,
+            precision=self.precision,
+        )  # pytype: disable=wrong-keyword-args
+        # back to the original inputs dimensions
+        out = DenseGeneral(
+            features=features,
+            axis=(-2, -1),
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            dot_general=self.out_dot_general,
+            name="out",  # type: ignore[call-arg]
+        )(x)
+        return out
+
+
+class LinearSelfAttention(LinearMultiHeadAttention):
+    """Self-attention special case of multi-head dot-product attention."""
+
+    @compact
+    def __call__(
+        self,
+        inputs_q: Array,
+        mask: Optional[Array] = None,  # type: ignore
+    ):
+        """Applies multi-head dot product self-attention on the input data.
+
+        Projects the inputs into multi-headed query, key, and value vectors,
+        applies dot-product attention and project the results to an output vector.
+
+        Args:
+          inputs_q: input queries of shape
+            `[batch_sizes..., length, features]`.
+          mask: attention mask of shape
+            `[batch_sizes..., num_heads, query_length, key/value_length]`.
+            Attention weights are masked out if their corresponding mask value
+            is `False`.
+          deterministic: if false, the attention weight is masked randomly
+            using dropout, whereas if true, the attention weights
+            are deterministic.
+
+        Returns:
+          output of shape `[batch_sizes..., length, features]`.
+        """
+        return super().__call__(inputs_q, inputs_q, mask)
 
 
 CheckpointSelfAttention = nn.checkpoint(nn.SelfAttention)
@@ -37,7 +275,7 @@ class TransformerConfig:
     decode: bool = False
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
-    posemb_init: Optional[Initializer] = None
+    posemb_init: Initializer = nn.initializers.xavier_uniform()
 
 
 def shift_right(x, axis=1):
@@ -193,27 +431,25 @@ class Encoder1DBlock(nn.Module):
 
         # Attention block.
         assert inputs.ndim == 3
-        x = nn.LayerNorm(dtype=config.dtype)(inputs)
-        x = CheckpointSelfAttention(
+        x = LinearSelfAttention(
             num_heads=config.num_heads,
             dtype=config.dtype,
             qkv_features=config.qkv_dim,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
             use_bias=False,
-            broadcast_dropout=False,
-            dropout_rate=config.attention_dropout_rate,
-            deterministic=config.deterministic,
-        )(x, encoder_mask)
+        )(inputs, encoder_mask)
 
         x = nn.Dropout(rate=config.dropout_rate)(x, deterministic=config.deterministic)
         x = x + inputs
 
-        # MLP block.
-        y = nn.LayerNorm(dtype=config.dtype)(x)
-        y = MlpBlock(config=config)(y)
+        x = nn.LayerNorm(dtype=config.dtype)(x)
 
-        return x + y
+        # MLP block.
+        y = MlpBlock(config=config)(x)
+        y = y + x
+
+        return nn.LayerNorm(dtype=config.dtype)(y)
 
 
 class EncoderDecoder1DBlock(nn.Module):
@@ -242,44 +478,41 @@ class EncoderDecoder1DBlock(nn.Module):
 
         # Decoder block.
         assert targets.ndim == 3
-        x = nn.LayerNorm(dtype=config.dtype)(targets)
-        x = CheckpointSelfAttention(
+        x = LinearSelfAttention(
             num_heads=config.num_heads,
             dtype=config.dtype,
             qkv_features=config.qkv_dim,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
             use_bias=False,
-            broadcast_dropout=False,
-            dropout_rate=config.attention_dropout_rate,
-            deterministic=config.deterministic,
             decode=config.decode,
-        )(x, decoder_mask)
+        )(targets, decoder_mask)
         x = nn.Dropout(rate=config.dropout_rate)(x, deterministic=config.deterministic)
         x = x + targets
 
+        x = nn.LayerNorm(dtype=config.dtype)(x)
+
         # Encoder-Decoder block.
-        y = nn.LayerNorm(dtype=config.dtype)(x)
-        y = CheckpointMultiHeadDotProductAttention(
+        y = LinearMultiHeadAttention(
             num_heads=config.num_heads,
             dtype=config.dtype,
             qkv_features=config.qkv_dim,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
             use_bias=False,
-            broadcast_dropout=False,
-            dropout_rate=config.attention_dropout_rate,
-            deterministic=config.deterministic,
-        )(y, encoded, encoder_decoder_mask)
+        )(x, encoded, encoder_decoder_mask)
 
         y = nn.Dropout(rate=config.dropout_rate)(y, deterministic=config.deterministic)
         y = y + x
 
-        # MLP block.
-        z = nn.LayerNorm(dtype=config.dtype)(y)
-        z = MlpBlock(config=config)(z)
+        y = nn.LayerNorm(dtype=config.dtype)(y)
 
-        return y + z
+        # MLP block.
+        z = MlpBlock(config=config)(y)
+
+        z = z + y
+
+        return nn.LayerNorm(dtype=config.dtype)(y)
 
 
 @struct.dataclass
@@ -327,7 +560,7 @@ class Encoder(nn.Module):
 
         dist_tokens = self.param(
             "dist_tokens",
-            nn.initializers.zeros,
+            nn.initializers.xavier_uniform(),
             (1, config.latent_length * 2, config.emb_dim),
         )
         dist_tokens = jnp.tile(dist_tokens, [x.shape[0], 1, 1])
@@ -351,8 +584,7 @@ class Encoder(nn.Module):
             if lyr < config.num_layers // 2:
                 outputs.append(x)
 
-        encoded = nn.LayerNorm(dtype=config.dtype, name="encoder_norm")(x)
-        dist_tokens = encoded[:, : dist_tokens.shape[1]]
+        dist_tokens = x[:, : dist_tokens.shape[1]]
         mu, logvar = jnp.split(dist_tokens, 2, axis=1)
         return EncoderOutput(mu, logvar)
 
@@ -393,21 +625,10 @@ class Decoder(nn.Module):
         assert targets.ndim == 3  # (batch, len, depth)
         assert config.num_layers % 2 == 1
 
-        # Target Embedding
-        if self.shared_embedding is None:
-            output_embed = nn.Dense(
-                features=config.emb_dim,
-                kernel_init=config.kernel_init,
-                bias_init=config.bias_init,
-            )
-        else:
-            output_embed = self.shared_embedding
-
         if not config.decode:
             y = shift_right(targets)
         else:
             y = jnp.zeros_like(targets)
-        y = output_embed(y)
         y = AddPositionEmbs(
             config=config, decode=config.decode, name="posembed_output"
         )(y)
@@ -431,14 +652,12 @@ class Decoder(nn.Module):
             if lyr < config.num_layers // 2:
                 outputs.append(y)
 
-        y = nn.LayerNorm(dtype=config.dtype, name="encoderdecoder_norm")(y)
-
         # Decoded Logits
         if config.recons_via_embedding:
             # Use the transpose of embedding matrix for logit transform.
-            logits = output_embed.attend(y.astype(jnp.float32))
+            recons = output_embed.attend(y.astype(jnp.float32))
             # Correctly normalize pre-softmax logits for this shared case.
-            logits = logits / jnp.sqrt(y.shape[-1])
+            recons = recons / jnp.sqrt(y.shape[-1])
         else:
             recons = nn.Dense(
                 config.output_size,
@@ -509,9 +728,11 @@ class Transformer(nn.Module):
             ],
             axis=1,
         )
-        encoder_mask = nn.make_attention_mask(
-            input_mask, input_mask, dtype=config.dtype
-        )
+        if self.config.decode:
+            pass
+        else:
+            encoder_mask = input_mask
+
         return self.encoder(inputs, encoder_mask=encoder_mask)
 
     def decode(
@@ -543,14 +764,8 @@ class Transformer(nn.Module):
             )
         else:
             encoded_mask = jnp.ones((encoded.shape[0], encoded.shape[1]))
-            decoder_mask = nn.make_attention_mask(
-                target_mask,
-                target_mask,
-                dtype=config.dtype,
-            )
-            encoder_decoder_mask = nn.make_attention_mask(
-                target_mask, encoded_mask, dtype=config.dtype
-            )
+            decoder_mask = target_mask
+            encoder_decoder_mask = encoded_mask
 
         reconstructed = self.decoder(
             encoded,

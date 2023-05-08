@@ -1,5 +1,6 @@
 from typing import Any, Optional
 from pathlib import Path
+
 import functools
 
 import jax
@@ -23,12 +24,16 @@ TransformerConfig = vae.models.TransformerConfig
 
 
 def prepare_dataset(dataset: Any, batch_size, epochs):
-    train_ds, train_info = dataset.prepare("train")
+    train_ds, train_info = dataset.prepare("train", shuffle_files=True)
+    train_ds = train_ds.shuffle(
+        train_info["num_samples"], reshuffle_each_iteration=True
+    )
+    train_ds = dataset.augment(train_ds)
     train_ds = train_ds.repeat(epochs)
     train_ds = dataset.batch(train_ds, batch_size, drop_remainder=True)
 
     eval_ds, eval_info = dataset.prepare("val")
-    eval_ds = dataset.batch(eval_ds, batch_size, shuffle=False)
+    eval_ds = dataset.batch(eval_ds, batch_size)
 
     return train_ds, train_info, eval_ds, eval_info
 

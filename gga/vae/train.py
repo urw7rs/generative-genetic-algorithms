@@ -4,11 +4,12 @@ import functools
 from pathlib import Path
 from dataclasses import asdict
 
-from tqdm.rich import tqdm
+from tqdm.auto import tqdm
 
 import dataclasses
 
 import numpy as np
+import torch
 
 import tensorflow as tf
 
@@ -34,8 +35,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from torch.utils.tensorboard import SummaryWriter
 
 from gga import smpl
-from gga.metrics import ReconstructionMetrics, GenerationMetrics
-from gga.metrics import compute_fid, compute_diversity
+from gga.metrics import ReconstructionMetrics, UnconditonalGenerationMetrics
 
 from . import models
 
@@ -142,6 +142,11 @@ def train_step(state, batch, ds_info, config, dropout_rng=None, noise_rng=None):
     return logs, new_state
 
 
+def reparam(mu, logvar, noise):
+    std = jnp.exp(0.5 * logvar)
+    return std * noise + mu
+
+
 def eval_step(state, batch, ds_info, config, noise_rng=None):
     """Calculate evaluation metrics on a batch."""
     eval_keys = ["motion", "mask"]
@@ -156,12 +161,13 @@ def eval_step(state, batch, ds_info, config, noise_rng=None):
         rngs={"noise": noise_rng},
     )
 
-    encoded_recons = models.Transformer(config).apply(
-        {"params": state.params},
-        output.recons,
-        input_mask,
-        method="encode",
+    # TODO: add encoder for generation metrics
+    encoded = models.Transformer(config).apply(
+        {"params": state.params}, output.recons, input_mask, method="encode"
     )
+
+    recons_latent = reparam(encoded.mu, encoded.logvar, output.noise)
+    latent = reparam(output.mu, output.logvar, output.noise)
 
     gt_pos = to_pos(inputs, ds_info)
     pos = to_pos(output.recons, ds_info)
@@ -185,8 +191,8 @@ def eval_step(state, batch, ds_info, config, noise_rng=None):
     }
 
     logs["generation_metrics"] = {
-        "predictions": output.mu,
-        "targets": encoded_recons.mu,
+        "predictions": recons_latent,
+        "targets": latent,
     }
 
     return logs, state
@@ -197,42 +203,6 @@ def collect(list_of_dicts, key):
     for entry in list_of_dicts:
         output.append(entry[key])
     return output
-
-
-def compute_metrics(history):
-    metrics = {}
-
-    # add epoch level losses
-    losses = collect(history, "losses")
-    for name in losses[0].keys():
-        metric = jnp.stack(collect(losses, name), axis=0).mean()
-        metric = jax.lax.pmean(metric, axis_name="device")
-        metrics[name] = metric
-
-    # add reconstruction metrics
-    reconstruction_metrics = collect(history, "reconstruction_metrics")
-    predictions = jnp.concatenate(
-        collect(reconstruction_metrics, "predictions"), axis=0
-    )
-    targets = jnp.concatenate(collect(reconstruction_metrics, "targets"), axis=0)
-    mask = jnp.concatenate(collect(reconstruction_metrics, "mask"), axis=0)
-
-    reconstruction_metrics = ReconstructionMetrics.create(predictions, targets, mask)
-    reconstruction_metrics = jax.lax.psum(reconstruction_metrics, axis_name="device")
-    metrics.update(reconstruction_metrics.compute())
-
-    return metrics
-
-
-def compute_np_metrics(history, key):
-    metrics = {}
-    # add generation metrics
-    generation_metrics = collect(history, "generation_metrics")
-    predictions = jnp.concatenate(collect(generation_metrics, "predictions"), axis=0)
-    targets = jnp.concatenate(collect(generation_metrics, "targets"), axis=0)
-    generation_metrics = GenerationMetrics.create(predictions, targets)
-    metrics.update(generation_metrics.compute(key))
-    return metrics
 
 
 def generate_samples(state, batch, config, noise_rng=None):
@@ -288,7 +258,6 @@ class TrainState(train_state.TrainState):
 @dataclasses.dataclass
 class LoopConfig:
     batch_size: int = 64
-    eval_steps: int = 100
     epochs: int = 6000
     learning_rate: float = 1e-4
     grad_accum_steps: int = 2
@@ -358,18 +327,29 @@ def train_loop(
     config: models.TransformerConfig,
 ):
     def best_fn(metrics: Mapping[str, float]) -> float:
-        return metrics["mpjpe"]
+        return metrics["FID"]
 
-    options = CheckpointManagerOptions(max_to_keep=5, best_fn=best_fn, best_mode="min")
+    best_ckpt = checkpoint / "best"
+    train_ckpt = checkpoint / "last"
 
-    checkpoint_manager = CheckpointManager(
-        checkpoint, Checkpointer(PyTreeCheckpointHandler()), options
+    checkpoint.mkdir(exist_ok=True)
+    best_ckpt.mkdir(exist_ok=True)
+    train_ckpt.mkdir(exist_ok=True)
+
+    best_ckpt_mngr = CheckpointManager(
+        best_ckpt,
+        Checkpointer(PyTreeCheckpointHandler()),
+        CheckpointManagerOptions(max_to_keep=5, best_fn=best_fn, best_mode="min"),
     )
 
-    if checkpoint_manager.latest_step() is not None:
-        state = checkpoint_manager.restore(
-            checkpoint_manager.latest_step(), items=state
-        )
+    train_ckpt_mngr = CheckpointManager(
+        train_ckpt,
+        Checkpointer(PyTreeCheckpointHandler()),
+        CheckpointManagerOptions(max_to_keep=2, keep_period=1000),
+    )
+
+    if train_ckpt_mngr.latest_step() is not None:
+        state = train_ckpt_mngr.restore(best_ckpt_mngr.latest_step(), items=state)
 
     state = jax_utils.replicate(state)
 
@@ -391,14 +371,12 @@ def train_loop(
         donate_argnums=(0,),
     )
 
-    p_compute_metrics = jax.pmap(compute_metrics, axis_name="device")
-
     writer = SummaryWriter()
 
-    if checkpoint_manager.latest_step() is None:
+    if train_ckpt_mngr.latest_step() is None:
         step = 0
     else:
-        step = checkpoint_manager.latest_step() + 1
+        step = train_ckpt_mngr.latest_step() + 1
 
     steps_per_epoch = train_info["num_samples"] // loop_config.batch_size
     total_steps = loop_config.epochs * steps_per_epoch - step
@@ -411,6 +389,12 @@ def train_loop(
             state, batch, dropout_rng=dropout_rngs, noise_rng=noise_rngs
         )
 
+        if step % 1000 == 0:
+            train_ckpt_mngr.save(
+                step,
+                jax_utils.unreplicate(state),
+            )
+
         if step % 50 == 0:
             # state is replicated for each device
             logs = jax_utils.unreplicate(logs)
@@ -420,29 +404,47 @@ def train_loop(
                 writer.add_scalar(f"train/{name}", metric.item(), step)
 
         if step % 10_000 == 0:
-            history = []
+            recons_metrics = ReconstructionMetrics(
+                njoints=22, jointstype="humanml3d", dist_sync_on_step=False
+            )
+            gen_metrics = UnconditonalGenerationMetrics(dist_sync_on_step=False)
+
             for batch in eval_ds.as_numpy_iterator():
                 batch.pop("text")
                 batch = common_utils.shard(batch)
 
-                log, state = p_eval_step(
+                logs, state = p_eval_step(
                     state,
                     batch,
                     noise_rng=noise_rngs,
                 )
 
-                history.append(log)
+                recons_logs = tree_util.tree_map(
+                    lambda x: torch.tensor(np.array(x)).flatten(0, 1),
+                    logs["reconstruction_metrics"],
+                )
+                preds = recons_logs["predictions"]
+                targets = recons_logs["targets"]
 
-            metrics = p_compute_metrics(history)
-            metrics = jax_utils.unreplicate(metrics)
+                lengths = np.array(recons_logs["mask"]).sum(1)
+                recons_metrics.update(preds, targets, lengths)
 
-            history = jax.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), history)
-            metrics.update(compute_np_metrics(history, eval_rng))
+                gen_logs = tree_util.tree_map(
+                    lambda x: torch.tensor(np.array(x)).flatten(0, 1),
+                    logs["generation_metrics"],
+                )
+                gen_metrics.update(
+                    gen_logs["predictions"], gen_logs["targets"], lengths
+                )
+
+            metrics = {}
+            metrics.update(recons_metrics.compute())
+            metrics.update(gen_metrics.compute())
 
             for name, metric in metrics.items():
-                writer.add_scalar(f"val/{name}", metric.item(), step)
+                writer.add_scalar(f"metrics/{name}", metric.item(), step)
 
-            checkpoint_manager.save(
+            best_ckpt_mngr.save(
                 step,
                 jax_utils.unreplicate(state),
                 metrics=tree_util.tree_map(lambda x: x.item(), metrics),
