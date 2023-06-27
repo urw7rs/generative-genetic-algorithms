@@ -12,10 +12,10 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="Chanhyuk Jung",
-    package_dir={"": "src"},
-    packages=find_packages(where="src"),
+    package_dir={"": "gga"},
+    packages=find_packages(where="gga"),
     python_requires=">=3.7",
-    install_requires=["flax"],
+    install_requires=["flax", "ciclo", "tensorflow_datasets", "jsonargparse"],
     extras_require={
         "test": ["pytest", "chex"],
         "dev": ["black", "flake8", "bumpver"],
